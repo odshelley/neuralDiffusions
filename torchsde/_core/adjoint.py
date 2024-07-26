@@ -96,7 +96,7 @@ class _SdeintAdjointMethod(torch.autograd.Function):
                             assert jump_time < t1
                             print(f"Jump time simulated at: {jump_time} is between {t0} and {t1}")
                             
-                            ts_temp = torch.tensor([cur_t0, jump_time], device='cuda')
+                            ts_temp = torch.tensor([cur_t0, jump_time], device='mps')
 
                             # Integrate over the current interval
                             y, extra_solver_state = solver.integrate(y, ts_temp, extra_solver_state)
@@ -119,7 +119,7 @@ class _SdeintAdjointMethod(torch.autograd.Function):
                             y = y[-1]
 
 
-                    ts_temp = torch.tensor([cur_t0, t1], device='cuda')
+                    ts_temp = torch.tensor([cur_t0, t1], device='mps')
                     extra_solver_state = tuple(x.detach() for x in extra_solver_state)
                     y = y.detach()
                     y, extra_solver_state = solver.integrate(y, ts_temp, extra_solver_state)
@@ -138,7 +138,7 @@ class _SdeintAdjointMethod(torch.autograd.Function):
                                 # Execute the desired operation
                                 print(f"Jump time recorded during forward: {jump_time} is between {t0} and {t1}")
                                 
-                                ts_temp = torch.tensor([cur_t0, jump_time], device='cuda')
+                                ts_temp = torch.tensor([cur_t0, jump_time], device='mps')
                                 y, extra_solver_state = solver.integrate(y, ts_temp, extra_solver_state)
                                 # (a, b), *extra_solver_state = y, extra_solver_state
                                 (temp_x, aug_state) = y
@@ -146,18 +146,19 @@ class _SdeintAdjointMethod(torch.autograd.Function):
 
                                 # # reflatten 
                                 aug_state = misc.flat_to_shape(aug_state.squeeze(0), shapes)
-                                
-                                
-                                identity_m = torch.ones_like(aug_state[1], device='cuda')
-                                
-                                diag_ident_m = torch.diag(identity_m[0])
-                                A = diag_ident_m - torch.diag(list(reversed(ctx.gradient_map))[idx][2][0])
+                                # Initialize the Jacobian list
 
+                                identity_m = torch.ones_like(aug_state[1], device='mps')   
+                                diag_ident_m = torch.diag(identity_m[0])
+
+                                A = diag_ident_m - torch.tensor(list(reversed(ctx.gradient_map))[idx][2][0], device='mps')
                                 X = torch.linalg.solve_triangular(A, aug_state[1][0].unsqueeze(1), upper=False)
 
                                 aug_state[1] = X.transpose(0,1)
-                                # torch.transpose(X,0,1)
+                                B = torch.flatten( aug_state[-4] )
+                                B_minus = B + X @ torch.tensor(list(reversed(ctx.gradient_map))[idx][1][0], device='mps')
 
+                                # 13,14,15
                                 # if i != 1:
                                 aug_state = misc.flatten(aug_state)
                                 aug_state = aug_state.unsqueeze(0)  # dummy batch dimension
@@ -170,7 +171,7 @@ class _SdeintAdjointMethod(torch.autograd.Function):
 
                                 idx +=1
 
-                    ts_temp = torch.tensor([cur_t0, t1], device='cuda')
+                    ts_temp = torch.tensor([cur_t0, t1], device='mps')
                     y, extra_solver_state = solver.integrate(y, ts_temp, extra_solver_state)
 
                 ys.append(y[-1])
@@ -416,7 +417,7 @@ def sdeint_adjoint(sde: nn.Module,
 
     jump_times = []
     # NOTE: hard-coded
-    # jump_times = [torch.empty(0, device='cuda') for _ in range(y0.shape[0])] 
+    # jump_times = [torch.empty(0, device='mps') for _ in range(y0.shape[0])] 
 
     shapes = y0.shape
 

@@ -603,12 +603,13 @@ def main(
     # device="mps"
     # print('HELLO?')
     # TODO: change
-    is_cuda = torch.cuda.is_available()
-    device = "cuda" if is_cuda else "cpu"
-    if not is_cuda:
-        print(
-            "Warning: CUDA not available; falling back to CPU but this is likely to be very slow."
-        )
+    device = 'mps'
+    # is_cuda = torch.cuda.is_available()
+    # device = "cuda" if is_cuda else "cpu"
+    # if not is_cuda:
+    #     print(
+    #         "Warning: CUDA not available; falling back to CPU but this is likely to be very slow."
+    #     )
 
     # Data
     ts, data_size, train_dataloader = get_data(batch_size=batch_size, device=device)

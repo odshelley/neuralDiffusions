@@ -575,7 +575,7 @@ def main(
     generator_lr=2e-3,  # Learning rate often needs careful tuning to the problem.
     discriminator_lr=1e-2,  # Learning rate often needs careful tuning to the problem.
     batch_size=1024,  # Batch size.
-    steps=10,  # How many steps to train both generator and discriminator for.
+    steps=50,  # How many steps to train both generator and discriminator for.
     init_mult1=2,  # Changing the initial parameter size can help.
     init_mult2=1.0,  #
     weight_decay=0.01,  # Weight decay.
@@ -595,12 +595,13 @@ def main(
     # device="mps"
     # print('HELLO?')
     # TODO: change
-    is_cuda = torch.cuda.is_available()
-    device = "cuda" if is_cuda else "cpu"
-    if not is_cuda:
-        print(
-            "Warning: CUDA not available; falling back to CPU but this is likely to be very slow."
-        )
+    device='mps'
+    # is_cuda = torch.cuda.is_available()
+    # device = "cuda" if is_cuda else "cpu"
+    # if not is_cuda:
+    #     print(
+    #         "Warning: CUDA not available; falling back to CPU but this is likely to be very slow."
+    #     )
 
     # Data
     ts, data_size, train_dataloader = get_data(batch_size=batch_size, device=device)

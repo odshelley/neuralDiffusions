@@ -38,7 +38,6 @@ import torchsde
 import tqdm
 
 
-
 ###################
 # First some standard helper objects.
 ###################
@@ -109,17 +108,74 @@ class GeneratorFunc(torch.nn.Module):
         t = t.expand(x.size(0), 1)
         tz = torch.cat([t, x], dim=1)
         return self._jump_magnitude(tz)
-
-    # NOTE: check how to use this 
+    
     def jump_gradient(self, t, x):
         t = t.expand(x.size(0), 1)
         tz = torch.cat([t, x], dim=1)
         with torch.enable_grad():
             tz = tz.detach().requires_grad_()
             jump_mag = self._jump_magnitude(tz)
-            grad_z = torch.autograd.grad(jump_mag, tz, torch.ones_like(jump_mag), retain_graph=True)
+            # Initialize the Jacobian list
+            jacobian_wrt_input = []
+            # Compute the Jacobian
+            for i in range(jump_mag.size(1)):  # Iterate over each output element
+                grad_output = torch.zeros_like(jump_mag)
+                grad_output[:, i] = 1
+                gradients = torch.autograd.grad(
+                    outputs=jump_mag,
+                    inputs=tz,
+                    grad_outputs=grad_output,
+                    create_graph=True,
+                    retain_graph=True,
+                    only_inputs=True
+                )[0]
+                jacobian_wrt_input.append(gradients[:, 1:].flatten())  # Exclude the gradient with respect to t
+
+        # Stack the Jacobian rows to form the full Jacobian matrix
+        jacobian_wrt_input = torch.stack(jacobian_wrt_input, dim=0)
+        # with torch.enable_grad():
+        #     tz = tz.detach().requires_grad_()
+        #     jump_mag = self._jump_magnitude(tz)
+        #     grad_z = torch.autograd.grad(jump_mag, tz, torch.ones_like(jump_mag), retain_graph=True)
         # deb=True
-        return grad_z[0][:, 1:]  # Discard gradient w.r.t. time
+        # return grad_z[0][:, 1:]
+
+        return jacobian_wrt_input
+
+
+    # NOTE: Delete this
+    # def jump_gradient(self, t, x):
+    #     t = t.expand(x.size(0), 1)
+    #     tz = torch.cat([t, x], dim=1)
+    #     with torch.enable_grad():
+    #         tz = tz.detach().requires_grad_()
+    #         jump_mag = self._jump_magnitude(tz)
+    #         # Initialize the Jacobian list
+    #         jacobian_wrt_weights = []
+    #         # Compute the Jacobian
+    #         for i in range(jump_mag.size(1)):  # Iterate over each output element
+    #             grad_output = torch.zeros_like(jump_mag)
+    #             grad_output[:, i] = 1
+    #             gradients = torch.autograd.grad(
+    #                 outputs=jump_mag,
+    #                 inputs=self._jump_magnitude.parameters(),
+    #                 grad_outputs=grad_output,
+    #                 create_graph=True,
+    #                 retain_graph=True,
+    #                 only_inputs=True
+    #             )
+    #             flattened_grads = torch.cat([grad.flatten() for grad in gradients])
+    #             jacobian_wrt_weights.append(flattened_grads)
+
+    #     # Stack the Jacobian rows to form the full Jacobian matrix
+    #     jacobian_wrt_weights = torch.stack(jacobian_wrt_weights, dim=0)
+
+    #     with torch.enable_grad():
+    #         tz = tz.detach().requires_grad_()
+    #         jump_mag = self._jump_magnitude(tz)
+    #         grad_z = torch.autograd.grad(jump_mag, tz, torch.ones_like(jump_mag), retain_graph=True)
+    #     # deb=True
+    #     return grad_z[0][:, 1:]  # Discard gradient w.r.t. time
 
     def jump_gradient_wrt_theta(self, t, x):
         t = t.expand(x.size(0), 1)
@@ -127,10 +183,27 @@ class GeneratorFunc(torch.nn.Module):
         with torch.enable_grad():
             tz = tz.detach().requires_grad_()
             jump_mag = self._jump_magnitude(tz)
-            # total_params = sum(p.numel() for p in self._jump_magnitude.parameters())
-            grad_theta = torch.autograd.grad(jump_mag, self._jump_magnitude.parameters(), torch.ones_like(jump_mag), retain_graph=True)
-        # deb=True
-        return grad_theta
+            # Initialize the Jacobian list
+            jacobian_wrt_weights = []
+            # Compute the Jacobian
+            for i in range(jump_mag.size(1)):  # Iterate over each output element
+                grad_output = torch.zeros_like(jump_mag)
+                grad_output[:, i] = 1
+                gradients = torch.autograd.grad(
+                    outputs=jump_mag,
+                    inputs=self._jump_magnitude.parameters(),
+                    grad_outputs=grad_output,
+                    create_graph=True,
+                    retain_graph=True,
+                    only_inputs=True
+                )
+                flattened_grads = torch.cat([grad.flatten() for grad in gradients])
+                jacobian_wrt_weights.append(flattened_grads)
+
+        # Stack the Jacobian rows to form the full Jacobian matrix
+        jacobian_wrt_weights = torch.stack(jacobian_wrt_weights, dim=0)
+   
+        return jacobian_wrt_weights
 
     def jump_gradient_wrt_time(self, t, x):
         t = t.expand(x.size(0), 1)
@@ -143,19 +216,35 @@ class GeneratorFunc(torch.nn.Module):
         # check if this is correct
         return grad_t[0][:, 0]  # Return gradient w.r.t. time only
 
+
+    # def jump_occurred(self, t0, t1):
+    #     # Calculate the expected number of jumps in the interval (t0, t1)
+    #     # t0 = 0
+    #     # t1 = T 
+    #     expected_jumps = self._jump_intensity * (t1 - t0).item()
+    #     # NOTE: follows a simple poisson with intensity of 1 
+    #     num_jumps = torch.poisson(torch.tensor(expected_jumps)).item()
+
+    #     # Generate jump times if any jumps occurred
+    #     if num_jumps > 0:
+    #         # jump_times = np.random.uniform(t0, t1, num_jumps)
+    #         jump_times = torch.sort(t0 + (t1 - t0) * torch.rand(num_jumps)).values
+    #         return jump_times
+    #     else:
+    #         return torch.tensor([])
     
     def jump_occurred_batch(self, t0, t1, batch_size):
         expected_jumps = self._jump_intensity * (t1 - t0).item()
-        num_jumps = torch.poisson(torch.tensor([expected_jumps] * batch_size, device='cuda'))
+        num_jumps = torch.tensor([1], device='mps')#torch.poisson(torch.tensor([expected_jumps] * batch_size, device='mps'))
         
         jump_times_list = []
         for b in range(batch_size):
             num_jumps_b = int(num_jumps[b].item())
             if num_jumps_b > 0:
-                jump_times = torch.sort(t0 + (t1 - t0) * torch.rand((num_jumps_b,), device='cuda')).values
+                jump_times = torch.sort(t0 + (t1 - t0) * torch.rand((num_jumps_b,), device='mps')).values
                 jump_times_list.append(jump_times)
             else:
-                jump_times_list.append(torch.tensor([], device='cuda'))
+                jump_times_list.append(torch.tensor([], device='mps'))
         
         return jump_times_list
 
@@ -422,10 +511,11 @@ def main(
         num_plot_samples=1,                  # How many samples to use on the plots at the end.
         plot_locs=(0.1, 0.3, 0.5, 0.7, 0.9),  # Plot some marginal distributions at this proportion of the way along.
 ):
-    is_cuda = torch.cuda.is_available()
-    device = 'cuda' if is_cuda else 'cpu'
-    if not is_cuda:
-        print("Warning: CUDA not available; falling back to CPU but this is likely to be very slow.")
+    # is_cuda = torch.cuda.is_available()
+    # device = 'cuda' if is_cuda else 'cpu'
+    # if not is_cuda:
+    #     print("Warning: CUDA not available; falling back to CPU but this is likely to be very slow.")
+    device='mps'
 
     # Data
     ts, data_size, train_dataloader = get_data(batch_size=batch_size, device=device)
