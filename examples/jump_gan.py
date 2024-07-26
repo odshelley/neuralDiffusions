@@ -38,6 +38,7 @@ import torchsde
 import tqdm
 
 
+
 ###################
 # First some standard helper objects.
 ###################
@@ -126,7 +127,7 @@ class GeneratorFunc(torch.nn.Module):
         with torch.enable_grad():
             tz = tz.detach().requires_grad_()
             jump_mag = self._jump_magnitude(tz)
-            total_params = sum(p.numel() for p in self._jump_magnitude.parameters())
+            # total_params = sum(p.numel() for p in self._jump_magnitude.parameters())
             grad_theta = torch.autograd.grad(jump_mag, self._jump_magnitude.parameters(), torch.ones_like(jump_mag), retain_graph=True)
         # deb=True
         return grad_theta
@@ -142,22 +143,6 @@ class GeneratorFunc(torch.nn.Module):
         # check if this is correct
         return grad_t[0][:, 0]  # Return gradient w.r.t. time only
 
-
-    # def jump_occurred(self, t0, t1):
-    #     # Calculate the expected number of jumps in the interval (t0, t1)
-    #     # t0 = 0
-    #     # t1 = T 
-    #     expected_jumps = self._jump_intensity * (t1 - t0).item()
-    #     # NOTE: follows a simple poisson with intensity of 1 
-    #     num_jumps = torch.poisson(torch.tensor(expected_jumps)).item()
-
-    #     # Generate jump times if any jumps occurred
-    #     if num_jumps > 0:
-    #         # jump_times = np.random.uniform(t0, t1, num_jumps)
-    #         jump_times = torch.sort(t0 + (t1 - t0) * torch.rand(num_jumps)).values
-    #         return jump_times
-    #     else:
-    #         return torch.tensor([])
     
     def jump_occurred_batch(self, t0, t1, batch_size):
         expected_jumps = self._jump_intensity * (t1 - t0).item()

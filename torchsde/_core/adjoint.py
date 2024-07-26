@@ -15,7 +15,7 @@
 import torch
 from torch import nn
 import warnings
-# import pydevd
+import pydevd
 
 from . import base_sde
 from . import methods
@@ -34,7 +34,7 @@ class _SdeintAdjointMethod(torch.autograd.Function):
                 dt_min, adjoint_options, len_extras, 
                 jump_times, gradient_map, shapes,
                 y0, *extras_and_adjoint_params):
-        # pydevd.settrace(suspend=False, trace_only_current_thread=True)
+        pydevd.settrace(suspend=False, trace_only_current_thread=True)
         ctx.sde = sde
         ctx.dt = dt
         ctx.bm = bm      
@@ -94,7 +94,7 @@ class _SdeintAdjointMethod(torch.autograd.Function):
 
                             assert t0 < jump_time
                             assert jump_time < t1
-                            # print(f"Jump time simulated at: {jump_time} is between {t0} and {t1}")
+                            print(f"Jump time simulated at: {jump_time} is between {t0} and {t1}")
                             
                             ts_temp = torch.tensor([cur_t0, jump_time], device='cuda')
 
@@ -136,7 +136,7 @@ class _SdeintAdjointMethod(torch.autograd.Function):
                             jump_time = -jt.item()
                             if t0 <= jump_time <= t1:
                                 # Execute the desired operation
-                                # print(f"Jump time recorded during forward: {jump_time} is between {t0} and {t1}")
+                                print(f"Jump time recorded during forward: {jump_time} is between {t0} and {t1}")
                                 
                                 ts_temp = torch.tensor([cur_t0, jump_time], device='cuda')
                                 y, extra_solver_state = solver.integrate(y, ts_temp, extra_solver_state)
@@ -197,7 +197,7 @@ class _SdeintAdjointMethod(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_ys, *grad_extra_solver_state):  # noqa
-        # pydevd.settrace(suspend=False, trace_only_current_thread=True)
+        pydevd.settrace(suspend=False, trace_only_current_thread=True)
         ys, ts, *extras_and_adjoint_params = ctx.saved_tensors
         if ctx.saved_extras_for_backward:
             extra_solver_state = extras_and_adjoint_params[:ctx.len_extras]
