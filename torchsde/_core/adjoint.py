@@ -99,7 +99,7 @@ class _SdeintAdjointMethod(torch.autograd.Function):
 
                             assert t0 < jump_time
                             assert jump_time < t1
-                            print(f"Jump time simulated at: {jump_time} is between {t0} and {t1}")
+                            # print(f"Jump time simulated at: {jump_time} is between {t0} and {t1}")
                             
                             ts_temp = torch.tensor([cur_t0, jump_time], device='mps')
 
@@ -141,7 +141,7 @@ class _SdeintAdjointMethod(torch.autograd.Function):
                             jump_time = -jt.item()
                             if t0 <= jump_time <= t1:
                                 # Execute the desired operation
-                                print(f"Jump time recorded during forward: {jump_time} is between {t0} and {t1}")
+                                # print(f"Jump time recorded during forward: {jump_time} is between {t0} and {t1}")
                                 
                                 ts_temp = torch.tensor([cur_t0, jump_time], device='mps')
                                 y, extra_solver_state = solver.integrate(y, ts_temp, extra_solver_state)
@@ -154,7 +154,7 @@ class _SdeintAdjointMethod(torch.autograd.Function):
 
                                 identity_m = torch.ones_like(aug_state[1], device='mps')   
                                 diag_ident_m = torch.diag(identity_m[0])
-                                jacobian = torch.tensor(list(reversed(ctx.gradient_map))[idx][2][:], device='mps')
+                                jacobian = list(reversed(ctx.gradient_map))[idx][2][:].clone().detach().to('mps')
                                 A = diag_ident_m - jacobian
                                 a_minus = torch.linalg.solve_triangular(A, aug_state[1][0].unsqueeze(1), upper=False)
                                 a_minus = a_minus.transpose(0,1)
@@ -165,7 +165,7 @@ class _SdeintAdjointMethod(torch.autograd.Function):
                                     a_theta.append(torch.flatten(aug_state[i]))
                                 a_theta = torch.cat(a_theta, dim=0)
 
-                                jacboian_theta = torch.tensor(list(reversed(ctx.gradient_map))[idx][0][:], device='mps')
+                                jacboian_theta = list(reversed(ctx.gradient_map))[idx][0][:].clone().detach().to('mps')
                                 a_theta_minus = a_theta + a_minus @ jacboian_theta
                                 # TODO: Clean this up 
                                 old_idx = 0

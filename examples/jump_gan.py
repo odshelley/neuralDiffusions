@@ -448,11 +448,11 @@ def plot(ts, generator, dataloader, num_plot_samples, plot_locs):
         generated_first = True
         for real_sample_ in real_samples:
             kwargs = {'label': 'Real'} if real_first else {}
-            plt.plot(ts.cpu(), real_sample_.cpu(), color='dodgerblue', linewidth=0.5, alpha=0.7, **kwargs)
+            plt.plot(ts.detach().cpu().numpy(), real_sample_.detach().cpu().numpy(), color='dodgerblue', linewidth=0.5, alpha=0.7, **kwargs)
             real_first = False
         for generated_sample_ in generated_samples:
             kwargs = {'label': 'Generated'} if generated_first else {}
-            plt.plot(ts.cpu(), generated_sample_.cpu(), color='crimson', linewidth=0.5, alpha=0.7, **kwargs)
+            plt.plot(ts.detach().cpu().numpy(), generated_sample_.detach().cpu().numpy(), color='crimson', linewidth=0.5, alpha=0.7, **kwargs)
             generated_first = False
         # plt.legend()
         plt.title(f"{num_plot_samples} samples from both real and generated distributions.")
@@ -500,14 +500,14 @@ def main(
         generator_lr=2e-4,      # Learning rate often needs careful tuning to the problem.
         discriminator_lr=1e-3,  # Learning rate often needs careful tuning to the problem.
         batch_size=1,        # Batch size.
-        steps=100,            # How many steps to train both generator and discriminator for.
+        steps=2,            # How many steps to train both generator and discriminator for.
         init_mult1=3,           # Changing the initial parameter size can help.
         init_mult2=0.5,         #
         weight_decay=0.01,      # Weight decay.
         swa_step_start=500,    # When to start using stochastic weight averaging.
 
         # Evaluation and plotting hyperparameters
-        steps_per_print=10,                   # How often to print the loss.
+        steps_per_print=2,                   # How often to print the loss.
         num_plot_samples=1,                  # How many samples to use on the plots at the end.
         plot_locs=(0.1, 0.3, 0.5, 0.7, 0.9),  # Plot some marginal distributions at this proportion of the way along.
 ):
