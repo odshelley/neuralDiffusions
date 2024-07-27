@@ -15,7 +15,11 @@
 import torch
 from torch import nn
 import warnings
-import pydevd
+# import pydevd
+import operator
+from functools import reduce
+
+
 
 from . import base_sde
 from . import methods
@@ -34,7 +38,7 @@ class _SdeintAdjointMethod(torch.autograd.Function):
                 dt_min, adjoint_options, len_extras, 
                 jump_times, gradient_map, shapes,
                 y0, *extras_and_adjoint_params):
-        pydevd.settrace(suspend=False, trace_only_current_thread=True)
+        # pydevd.settrace(suspend=False, trace_only_current_thread=True)
         ctx.sde = sde
         ctx.dt = dt
         ctx.bm = bm      
@@ -45,6 +49,7 @@ class _SdeintAdjointMethod(torch.autograd.Function):
         ctx.dt_min = dt_min
         ctx.adjoint_options = adjoint_options
         ctx.len_extras = len_extras
+        ctx.shapes = shapes
 
         ctx.jump_times = jump_times
         ctx.gradient_map = gradient_map
@@ -144,22 +149,32 @@ class _SdeintAdjointMethod(torch.autograd.Function):
                                 (temp_x, aug_state) = y
                                 # # aug_state[0] += reversed(ctx.gradient_map)[0][0]
 
-                                # # reflatten 
+                                # reflatten 
                                 aug_state = misc.flat_to_shape(aug_state.squeeze(0), shapes)
-                                # Initialize the Jacobian list
 
                                 identity_m = torch.ones_like(aug_state[1], device='mps')   
                                 diag_ident_m = torch.diag(identity_m[0])
+                                jacobian = torch.tensor(list(reversed(ctx.gradient_map))[idx][2][:], device='mps')
+                                A = diag_ident_m - jacobian
+                                a_minus = torch.linalg.solve_triangular(A, aug_state[1][0].unsqueeze(1), upper=False)
+                                a_minus = a_minus.transpose(0,1)
+                                aug_state[1] = a_minus
 
-                                A = diag_ident_m - torch.tensor(list(reversed(ctx.gradient_map))[idx][2][0], device='mps')
-                                X = torch.linalg.solve_triangular(A, aug_state[1][0].unsqueeze(1), upper=False)
+                                a_theta = []
+                                for i in range(-4,0):
+                                    a_theta.append(torch.flatten(aug_state[i]))
+                                a_theta = torch.cat(a_theta, dim=0)
 
-                                aug_state[1] = X.transpose(0,1)
-                                B = torch.flatten( aug_state[-4] )
-                                B_minus = B + X @ torch.tensor(list(reversed(ctx.gradient_map))[idx][1][0], device='mps')
-
-                                # 13,14,15
-                                # if i != 1:
+                                jacboian_theta = torch.tensor(list(reversed(ctx.gradient_map))[idx][0][:], device='mps')
+                                a_theta_minus = a_theta + a_minus @ jacboian_theta
+                                # TODO: Clean this up 
+                                old_idx = 0
+                                for i in range(-4,0):
+                                    idx = old_idx + reduce(operator.mul, ctx.shapes[i])
+                                    shape = ctx.shapes[i]
+                                    aug_state[len(aug_state)+i] = a_theta_minus[0][old_idx:idx].view(shape)
+                                    old_idx = idx
+            
                                 aug_state = misc.flatten(aug_state)
                                 aug_state = aug_state.unsqueeze(0)  # dummy batch dimension
 
@@ -198,7 +213,7 @@ class _SdeintAdjointMethod(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_ys, *grad_extra_solver_state):  # noqa
-        pydevd.settrace(suspend=False, trace_only_current_thread=True)
+        # pydevd.settrace(suspend=False, trace_only_current_thread=True)
         ys, ts, *extras_and_adjoint_params = ctx.saved_tensors
         if ctx.saved_extras_for_backward:
             extra_solver_state = extras_and_adjoint_params[:ctx.len_extras]
