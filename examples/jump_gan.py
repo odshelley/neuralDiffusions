@@ -238,7 +238,7 @@ class GeneratorFunc(torch.nn.Module):
         expected_jumps = self._jump_intensity * (t1 - t0).item()
         num_jumps = np.random.poisson([expected_jumps] * batch_size).tolist()
         num_jumps = torch.tensor(num_jumps, device='mps')
-        # num_jumps = torch.tensor([1], device='mps')#torch.poisson(torch.tensor([expected_jumps] * batch_size, device='mps'))
+        num_jumps2 = torch.tensor([1] * batch_size, device='mps')#torch.poisson(torch.tensor([expected_jumps] * batch_size, device='mps'))
         
         jump_times_list = []
         for b in range(batch_size):

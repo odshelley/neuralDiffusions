@@ -20,7 +20,6 @@ import operator
 from functools import reduce
 
 
-
 from . import base_sde
 from . import methods
 from . import misc
@@ -97,8 +96,8 @@ class _SdeintAdjointMethod(torch.autograd.Function):
                             extra_solver_state = tuple(x.detach() for x in extra_solver_state)
                             y = y.detach()
 
-                            assert t0 < jump_time
-                            assert jump_time < t1
+                            assert t0 <= jump_time
+                            assert jump_time <= t1
                             # print(f"Jump time simulated at: {jump_time} is between {t0} and {t1}")
                             
                             ts_temp = torch.tensor([cur_t0, jump_time], device='mps')
@@ -154,6 +153,8 @@ class _SdeintAdjointMethod(torch.autograd.Function):
 
                                 identity_m = torch.ones_like(aug_state[1], device='mps')   
                                 diag_ident_m = torch.diag(identity_m[0])
+                                check0 = list(reversed(ctx.gradient_map))
+                                check = list(reversed(ctx.gradient_map))[idx][2][:].clone().detach().to('mps')
                                 jacobian = list(reversed(ctx.gradient_map))[idx][2][:].clone().detach().to('mps')
                                 A = diag_ident_m - jacobian
                                 a_minus = torch.linalg.solve_triangular(A, aug_state[1][0].unsqueeze(1), upper=False)
@@ -170,10 +171,10 @@ class _SdeintAdjointMethod(torch.autograd.Function):
                                 # TODO: Clean this up 
                                 old_idx = 0
                                 for i in range(-4,0):
-                                    idx = old_idx + reduce(operator.mul, ctx.shapes[i])
+                                    idx_ = old_idx + reduce(operator.mul, ctx.shapes[i])
                                     shape = ctx.shapes[i]
-                                    aug_state[len(aug_state)+i] = a_theta_minus[0][old_idx:idx].view(shape)
-                                    old_idx = idx
+                                    aug_state[len(aug_state)+i] = a_theta_minus[0][old_idx:idx_].view(shape)
+                                    old_idx = idx_
             
                                 aug_state = misc.flatten(aug_state)
                                 aug_state = aug_state.unsqueeze(0)  # dummy batch dimension
