@@ -69,12 +69,6 @@ class MLP(torch.nn.Module):
     def forward(self, x):
         return self._model(x)
 
-
-###################
-# Now we define the SDEs.
-#
-# We begin by defining the generator SDE.
-###################
 class GeneratorFunc(torch.nn.Module):
     sde_type = 'stratonovich'
     noise_type = 'general'
@@ -92,17 +86,21 @@ class GeneratorFunc(torch.nn.Module):
         # If you have problems with very high drift/diffusions then consider scaling these so that they squash to e.g.
         # [-3, 3] rather than [-1, 1].
         ###################
-        self._drift = MLP(1 + hidden_size, hidden_size, mlp_size, num_layers, tanh=True)
-        self._diffusion = MLP(1 + hidden_size, hidden_size * noise_size, mlp_size, num_layers, tanh=True)
+        # self._drift = MLP(1 + hidden_size, hidden_size, mlp_size, num_layers, tanh=True)
+        # self._diffusion = MLP(1 + hidden_size, hidden_size * noise_size, mlp_size, num_layers, tanh=True)
         self._jump_magnitude = MLP(1 + hidden_size, hidden_size, mlp_size, num_layers, tanh=True)
 
 
     def f_and_g(self, t, x):
         # t has shape ()
         # x has shape (batch_size, hidden_size)
+        # t = t.expand(x.size(0), 1)
+        # tx = torch.cat([t, x], dim=1)
+        # return self._drift(tx), self._diffusion(tx).view(x.size(0), self._hidden_size, self._noise_size)
         t = t.expand(x.size(0), 1)
-        tx = torch.cat([t, x], dim=1)
-        return self._drift(tx), self._diffusion(tx).view(x.size(0), self._hidden_size, self._noise_size)
+        drift = torch.zeros_like(x, device=x.device)  # Drift coefficient is always zero
+        diffusion = torch.zeros(x.size(0), self._hidden_size, self._noise_size, device=x.device)  # Diffusion coefficient is always zero
+        return drift, diffusion
 
 
     def jump_magnitude(self, t, x):
@@ -143,41 +141,6 @@ class GeneratorFunc(torch.nn.Module):
 
         return jacobian_wrt_input
 
-
-    # NOTE: Delete this
-    # def jump_gradient(self, t, x):
-    #     t = t.expand(x.size(0), 1)
-    #     tz = torch.cat([t, x], dim=1)
-    #     with torch.enable_grad():
-    #         tz = tz.detach().requires_grad_()
-    #         jump_mag = self._jump_magnitude(tz)
-    #         # Initialize the Jacobian list
-    #         jacobian_wrt_weights = []
-    #         # Compute the Jacobian
-    #         for i in range(jump_mag.size(1)):  # Iterate over each output element
-    #             grad_output = torch.zeros_like(jump_mag)
-    #             grad_output[:, i] = 1
-    #             gradients = torch.autograd.grad(
-    #                 outputs=jump_mag,
-    #                 inputs=self._jump_magnitude.parameters(),
-    #                 grad_outputs=grad_output,
-    #                 create_graph=True,
-    #                 retain_graph=True,
-    #                 only_inputs=True
-    #             )
-    #             flattened_grads = torch.cat([grad.flatten() for grad in gradients])
-    #             jacobian_wrt_weights.append(flattened_grads)
-
-    #     # Stack the Jacobian rows to form the full Jacobian matrix
-    #     jacobian_wrt_weights = torch.stack(jacobian_wrt_weights, dim=0)
-
-    #     with torch.enable_grad():
-    #         tz = tz.detach().requires_grad_()
-    #         jump_mag = self._jump_magnitude(tz)
-    #         grad_z = torch.autograd.grad(jump_mag, tz, torch.ones_like(jump_mag), retain_graph=True)
-    #     # deb=True
-    #     return grad_z[0][:, 1:]  # Discard gradient w.r.t. time
-
     def jump_gradient_wrt_theta(self, t, x):
         t = t.expand(x.size(0), 1)
         tz = torch.cat([t, x], dim=1)
@@ -213,32 +176,13 @@ class GeneratorFunc(torch.nn.Module):
             tz = tz.detach().requires_grad_()
             jump_mag = self._jump_magnitude(tz)
             grad_t = torch.autograd.grad(jump_mag, tz, torch.ones_like(jump_mag), retain_graph=True)
-        # deb=True
         # check if this is correct
         return grad_t[0][:, 0]  # Return gradient w.r.t. time only
-
-
-    # def jump_occurred(self, t0, t1):
-    #     # Calculate the expected number of jumps in the interval (t0, t1)
-    #     # t0 = 0
-    #     # t1 = T 
-    #     expected_jumps = self._jump_intensity * (t1 - t0).item()
-    #     # NOTE: follows a simple poisson with intensity of 1 
-    #     num_jumps = torch.poisson(torch.tensor(expected_jumps)).item()
-
-    #     # Generate jump times if any jumps occurred
-    #     if num_jumps > 0:
-    #         # jump_times = np.random.uniform(t0, t1, num_jumps)
-    #         jump_times = torch.sort(t0 + (t1 - t0) * torch.rand(num_jumps)).values
-    #         return jump_times
-    #     else:
-    #         return torch.tensor([])
     
     def jump_occurred_batch(self, t0, t1, batch_size):
         expected_jumps = self._jump_intensity * (t1 - t0).item()
         num_jumps = np.random.poisson([expected_jumps] * batch_size).tolist()
         num_jumps = torch.tensor(num_jumps, device='mps')
-        num_jumps2 = torch.tensor([1] * batch_size, device='mps')#torch.poisson(torch.tensor([expected_jumps] * batch_size, device='mps'))
         
         jump_times_list = []
         for b in range(batch_size):
@@ -251,26 +195,27 @@ class GeneratorFunc(torch.nn.Module):
         
         return jump_times_list
 
-    
-    
-
-
-
-    
 
         
-###################
-# Now we wrap it up into something that computes the SDE.
-###################
 class Generator(torch.nn.Module):
-    def __init__(self, data_size, initial_noise_size, noise_size, hidden_size, mlp_size, num_layers):
+    def __init__(
+        self,
+        data_size,
+        initial_noise_size,
+        noise_size,
+        hidden_size,
+        mlp_size,
+        num_layers,
+    ):
         super().__init__()
         self._initial_noise_size = initial_noise_size
         self._hidden_size = hidden_size
-
-        self._initial = MLP(initial_noise_size, hidden_size, mlp_size, num_layers, tanh=False)
+        self.data_size = 1
+        self._initial = MLP(
+            initial_noise_size, hidden_size, mlp_size, num_layers, tanh=False
+        )
+        self._linear = torch.nn.Linear(hidden_size, 1)
         self._func = GeneratorFunc(noise_size, hidden_size, mlp_size, num_layers)
-        self._readout = torch.nn.Linear(hidden_size, data_size)
 
     def forward(self, ts, batch_size):
         # ts has shape (t_size,) and corresponds to the points we want to evaluate the SDE at.
@@ -280,14 +225,20 @@ class Generator(torch.nn.Module):
         ###################
         init_noise = torch.randn(batch_size, self._initial_noise_size, device=ts.device)
         x0 = self._initial(init_noise)
+        x0 = self._linear(x0)
 
         ###################
         # We use the reversible Heun method to get accurate gradients whilst using the adjoint method.
         ###################
-        xs = torchsde.sdeint_adjoint(self._func, x0, ts, method='reversible_heun', dt=1.0,
-                                     adjoint_method='adjoint_reversible_heun',)
-        xs = xs.transpose(0, 1)
-        ys = self._readout(xs)
+        xs = torchsde.sdeint_adjoint(
+            self._func,
+            x0,
+            ts,
+            method="reversible_heun",
+            dt=1.0,
+            adjoint_method="adjoint_reversible_heun",
+        )
+        ys = xs.transpose(0, 1)
 
         ###################
         # Normalise the data to the form that the discriminator expects, in particular including time as a channel.
@@ -349,52 +300,55 @@ class Discriminator(torch.nn.Module):
 # Generate some data. For this example we generate some synthetic data from a time-dependent Ornstein-Uhlenbeck SDE.
 ###################
 def get_data(batch_size, device):
+    
     dataset_size = 10
     t_size = 64
 
-    class OrnsteinUhlenbeckSDE(torch.nn.Module):
-        sde_type = 'ito'
-        noise_type = 'scalar'
+    class PoissonProcessSimulator:
+        def __init__(self, jump_intensity):
+            self._jump_intensity = jump_intensity
 
-        def __init__(self, mu, theta, sigma):
-            super().__init__()
-            self.register_buffer('mu', torch.as_tensor(mu))
-            self.register_buffer('theta', torch.as_tensor(theta))
-            self.register_buffer('sigma', torch.as_tensor(sigma))
+        def jump_occurred_batch(self, t0, t1, batch_size):
+            expected_jumps = self._jump_intensity * (t1 - t0).item()
+            num_jumps = np.random.poisson([expected_jumps] * batch_size).tolist()
+            num_jumps = torch.tensor(num_jumps, device=t0.device)
 
-        def f(self, t, y):
-            return self.mu * t - self.theta * y
+            jump_times_list = []
+            for b in range(batch_size):
+                num_jumps_b = int(num_jumps[b].item())
+                if num_jumps_b > 0:
+                    jump_times = torch.sort(t0 + (t1 - t0) * torch.rand((num_jumps_b,), device=t0.device)).values
+                    jump_times_list.append(jump_times)
+                else:
+                    jump_times_list.append(torch.tensor([], device=t0.device))
 
-        def g(self, t, y):
-            return self.sigma.expand(y.size(0), 1, 1) * (2 * t / t_size)
+            return jump_times_list
 
-    ou_sde = OrnsteinUhlenbeckSDE(mu=0.02, theta=0.1, sigma=0.4).to(device)
-    y0 = torch.rand(dataset_size, device=device).unsqueeze(-1) * 2 - 1
+    poisson_simulator = PoissonProcessSimulator(jump_intensity=1)
+    # Define time range
+    t0 = torch.tensor(0.0, device=device)
+    t1 = torch.tensor(float(t_size), device=device)
+
+    # Simulate jump times for the Poisson process
+    jump_times_list = poisson_simulator.jump_occurred_batch(t0, t1, dataset_size)
+
+    # Convert jump times to Poisson process paths
+    poisson_paths = []
+    for jump_times in jump_times_list:
+        path = torch.zeros(t_size, device=device)
+        for jump_time in jump_times:
+            path[int(jump_time.item()):] += 1
+        poisson_paths.append(path)
+
+    poisson_paths = torch.stack(poisson_paths)
     ts = torch.linspace(0, t_size - 1, t_size, device=device)
-    ys = torchsde.sdeint(ou_sde, y0, ts, dt=1e-1)
-
-    ###################
-    # To demonstrate how to handle irregular data, then here we additionally drop some of the data (by setting it to
-    # NaN.)
-    ###################
-    ys_num = ys.numel()
-    to_drop = torch.randperm(ys_num)[:int(0.3 * ys_num)]
-    ys.view(-1)[to_drop] = float('nan')
-
-    ###################
-    # Typically important to normalise data. Note that the data is normalised with respect to the statistics of the
-    # initial data, _not_ the whole time series. This seems to help the learning process, presumably because if the
-    # initial condition is wrong then it's pretty hard to learn the rest of the SDE correctly.
-    ###################
-    y0_flat = ys[0].view(-1)
-    y0_not_nan = y0_flat.masked_select(~torch.isnan(y0_flat))
-    ys = (ys - y0_not_nan.mean()) / y0_not_nan.std()
+    ys = poisson_paths.unsqueeze(-1)
 
     ###################
     # As discussed, time must be included as a channel for the discriminator.
     ###################
     ys = torch.cat([ts.unsqueeze(0).unsqueeze(-1).expand(dataset_size, t_size, 1),
-                    ys.transpose(0, 1)], dim=2)
+                    ys], dim=2)
     # shape (dataset_size=1000, t_size=100, 1 + data_size=3)
 
     ###################
@@ -459,8 +413,11 @@ def plot(ts, generator, dataloader, num_plot_samples, plot_locs):
             generated_first = False
         # plt.legend()
         plt.title(f"{num_plot_samples} samples from both real and generated distributions.")
+        # Add gridlines with finer control
+        plt.grid(True)
+
         plt.tight_layout()
-    plt.savefig("pic.pdf")
+    plt.savefig("pic_jump_w.pdf")
 
 
 ###################
@@ -495,7 +452,7 @@ def main(
         # Architectural hyperparameters. These are quite small for illustrative purposes.
         initial_noise_size=5,  # How many noise dimensions to sample at the start of the SDE.
         noise_size=3,          # How many dimensions the Brownian motion has.
-        hidden_size=16,        # How big the hidden size of the generator SDE and the discriminator CDE are.
+        hidden_size=1,        # How big the hidden size of the generator SDE and the discriminator CDE are.
         mlp_size=16,           # How big the layers in the various MLPs are.
         num_layers=1,          # How many hidden layers to have in the various MLPs.
 
@@ -503,7 +460,7 @@ def main(
         generator_lr=2e-4,      # Learning rate often needs careful tuning to the problem.
         discriminator_lr=1e-3,  # Learning rate often needs careful tuning to the problem.
         batch_size=1,        # Batch size.
-        steps=200,            # How many steps to train both generator and discriminator for.
+        steps=100,            # How many steps to train both generator and discriminator for.
         init_mult1=3,           # Changing the initial parameter size can help.
         init_mult2=0.5,         #
         weight_decay=0.01,      # Weight decay.
@@ -600,91 +557,3 @@ def main(
 
 if __name__ == '__main__':
     fire.Fire(main)
-
-###################
-# And that's (one way of doing) an SDE as a GAN. Have fun.
-###################
-
-###################
-# Appendix: discriminators for a neural SDE
-#
-# This is a little long, but should all be quite straightforward. By the end of this you should have a comprehensive
-# knowledge of how these things fit together.
-#
-# Let Y be the real/generated sample, and let H be the hidden state of the discriminator.
-# For real data, then Y is some interpolation of an (irregular) time series. (As with neural CDEs, if you're familiar -
-# for a nice exposition on this see https://github.com/patrick-kidger/torchcde/blob/master/example/irregular_data.py.)
-# In the case of generated data, then Y is _either_ the continuous-time sample produced by sdeint, _or_ it is an
-# interpolation (probably linear interpolation) of the generated sample between particular evaluation points, We'll
-# refer to these as cases (*) and (**) respectively.
-#
-# In terms of the mathematics, our options for the discriminator are:
-# (a1) Solve dH(t) = f(t, H(t)) dt + g(t, H(t)) dY(t),
-# (a2) Solve dH(t) = (f, g)(t, H(t)) d(t, Y(t))
-# (b) Solve dH(t) = f(t, H(t), Y(t)) dt.
-# Option (a1) is what is stated in the paper "Neural SDE as Infinite-Dimensional GANs".
-# Option (a2) is theoretically the same as (a1), but the drift and diffusion have been merged into a single function,
-# and the sample Y has been augmented with time. This can sometimes be a more helpful way to think about things.
-# Option (b) is a special case of the first two, by Appendix C of arXiv:2005.08926.
-# [Note that just dH(t) = g(t, H(t)) dY(t) would _not_ be enough, by what's known as the tree-like equivalence property.
-#  It's a bit technical, but the basic idea is that the discriminator wouldn't be able to tell how fast we traverse Y.
-#  This is a really easy mistake to make; make sure you don't fall into it.]
-#
-# Whether we use (*) or (**), and (a1) or (a2) or (b), doesn't really affect the quality of the discriminator, as far as
-# we know. However, these distinctions do affect how we solve them in terms of code. Depending on each combination, our
-# options are to use a solver of the following types:
-#
-#      | (a1)   (a2)   (b)
-# -----+----------------------
-#  (*) | SDE           SDE
-# (**) |        CDE    ODE
-#
-# So, (*) implies using an SDE solver: the continuous-time sample is only really available inside sdeint, so if we're
-# going to use the continuous-time sample then we need to solve generator and discriminator together inside a single SDE
-# solve. In this case, as our generator takes the form
-# Y(t) = l(X(t)) with dX(t) = μ(t, X(t)) dt + σ(t, X(t)) dW(t),
-# then
-# dY(t) = l(X(t)) dX(t) = l(X(t))μ(t, X(t)) dt + l(X(t))σ(t, X(t)) dW(t).
-# Then for (a1) we get
-# dH(t) = ( f(t, H(t)) + g(t, H(t))l(X(t))μ(t, X(t)) ) dt + g(t, H(t))l(X(t))σ(t, X(t)) dW(t),
-# which we can now put together into one big SDE solve:
-#  ( X(t) )   ( μ(t, X(t)                                )      ( σ(t, X(t))                  )
-# d( Y(t) ) = ( l(X(t))μ(t, X(t)                         ) dt + ( l(X(t))σ(t, X(t))           ) dW(t)
-#  ( H(t) )   ( f(t, H(t)) + g(t, H(t))l(X(t))μ(t, X(t)) )      ( g(t, H(t))l(X(t))σ(t, X(t)) ),
-# whilst for (b) we can put things together into one big SDE solve:
-#  ( X(t) )   ( μ(t, X(t))       )      ( σ(t, X(t))        )
-# d( Y(t) ) = ( l(X(t))μ(t, X(t) ) dt + ( l(X(t))σ(t, X(t)) ) dW(t)
-#  ( H(t) )   ( f(t, H(t), Y(t)) )      ( 0                 )
-#
-# Phew, what a lot of stuff to write down. Don't be put off by this: there's no complicated algebra, it's literally just
-# substituting one equation into another. Also, note that all of this is for the _generated_ data. If using real data,
-# then Y(t) is as previously described always an interpolation of the data. If you're able to evaluate the derivative of
-# the interpolation then you can then apply (a1) by rewriting it as dY(t) = (dY/dt)(t) dt and substituting in. If you're
-# able to evaluate the interpolation itself then you can apply (b) directly.
-#
-# The benefit of using (*) is that everything can be done inside a single SDE solve, which is important if you're
-# thinking about using adjoint methods and the like, for memory efficiency. The downside is that the code gets a bit
-# more complicated: you need to be able to solve just the generator on its own (to produce samples at inference time),
-# just the discriminator on its own (to evaluate the discriminator on the real data), and the combined
-# generator-discriminator system (to evaluate the discriminator on the generated data).
-#
-# Right, let's move on to (**). In comparison, this is much simpler. We don't need to substitute in anything. We're just
-# taking our generated data, sampling it at a bunch of points, and then doing some kind of interpolation (probably
-# linear interpolation). Then we either solve (a2) directly with a CDE solver (regardless of whether we're using real or
-# generated data), or solve (b) directly with an ODE solver (regardless of whether we're using real or generated data).
-#
-# The benefit of this is that it's much simpler to code: unlike (*) we can separate the generator and discriminator, and
-# don't ever need to combine them. Also, real and generated data is treated the same in the discriminator. (Which is
-# arguably a good thing anyway.) The downside is that we can't really take advantage of things like adjoint methods to
-# backpropagate efficiently through the generator, because we need to produce (and thus store) our generated sample at
-# lots of time points, which reduces the memory efficiency.
-#
-# Note that the use of ODE solvers for (**) is only valid because we're using _interpolated_ real or generated data,
-# and we're assuming that we're using some kind of interpolation that is at least piecewise smooth. (For example, linear
-# interpolation is piecewise smooth.) It wouldn't make sense to apply ODE solvers to some rough signal like Brownian
-# motion - that's what case (*) and SDE solvers are about.
-#
-# Right, let's wrap up this wall of text. Here, we use option (**), (a2). This is arguably the simplest option, and
-# is chosen as we'd like to keep the code readable in this example. To solve the CDEs we use the CDE solvers available
-# through torchcde: https://github.com/patrick-kidger/torchcde.
-###################
