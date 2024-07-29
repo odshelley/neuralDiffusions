@@ -36,6 +36,7 @@ import torch.optim.swa_utils as swa_utils
 import torchcde
 import torchsde
 import tqdm
+import numpy as np
 
 
 ###################
@@ -235,7 +236,9 @@ class GeneratorFunc(torch.nn.Module):
     
     def jump_occurred_batch(self, t0, t1, batch_size):
         expected_jumps = self._jump_intensity * (t1 - t0).item()
-        num_jumps = torch.tensor([1], device='mps')#torch.poisson(torch.tensor([expected_jumps] * batch_size, device='mps'))
+        num_jumps = np.random.poisson([expected_jumps] * batch_size).tolist()
+        num_jumps = torch.tensor(num_jumps, device='mps')
+        # num_jumps = torch.tensor([1], device='mps')#torch.poisson(torch.tensor([expected_jumps] * batch_size, device='mps'))
         
         jump_times_list = []
         for b in range(batch_size):
@@ -500,7 +503,7 @@ def main(
         generator_lr=2e-4,      # Learning rate often needs careful tuning to the problem.
         discriminator_lr=1e-3,  # Learning rate often needs careful tuning to the problem.
         batch_size=1,        # Batch size.
-        steps=2,            # How many steps to train both generator and discriminator for.
+        steps=1000,            # How many steps to train both generator and discriminator for.
         init_mult1=3,           # Changing the initial parameter size can help.
         init_mult2=0.5,         #
         weight_decay=0.01,      # Weight decay.
