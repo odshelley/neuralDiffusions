@@ -42,9 +42,12 @@ class GBMGeneratorFunc(torch.nn.Module):
     noise_type = "general"
 
     def __init__(
-        self, noise_size, hidden_size, mlp_size, num_layers, mu=MU, sigma=SIGMA
+        self, noise_size, hidden_size, mlp_size, num_layers, mu=MU, sigma=SIGMA, jump_intensity=1,
+        has_jumps=True,
     ):
         super().__init__()
+        self._jump_intensity = jump_intensity  # Rate parameter for the Poisson process
+        self.has_jumps = has_jumps
         self._noise_size = noise_size
         self._hidden_size = hidden_size
         self._output_size = 1
@@ -57,6 +60,9 @@ class GBMGeneratorFunc(torch.nn.Module):
         self._vol_mlp = MLP(
             1 + 1, hidden_size, mlp_size, num_layers, tanh=True
         )  # MLP for volatility of volatility
+        self._jump_magnitude = MLP(
+            1 + 1, 1, mlp_size, num_layers, tanh=True
+        )
 
     def f_and_g(self, t, x):
         # x consists of [S_t, v_t]
@@ -71,6 +77,103 @@ class GBMGeneratorFunc(torch.nn.Module):
 
         return drift, diffusion.view(x.size(0), self._output_size, self._noise_size)
     
+    def jump_magnitude(self, t, x):
+        t = t.expand(x.size(0), 1)
+        tz = torch.cat([t, x], dim=1)
+        magnitude = self._jump_magnitude(tz)
+        # magnitude = self._linear(magnitude) 
+        return magnitude * x / 64
+
+    def jump_gradient(self, t, x):
+        t = t.expand(x.size(0), 1)
+        tz = torch.cat([t, x], dim=1)
+        with torch.enable_grad():
+            tz = tz.detach().requires_grad_()
+            jump_mag = self._jump_magnitude(tz)
+            # Initialize the Jacobian list
+            jacobian_wrt_input = []
+            # Compute the Jacobian
+            for i in range(jump_mag.size(1)):  # Iterate over each output element
+                grad_output = torch.zeros_like(jump_mag)
+                grad_output[:, i] = 1
+                gradients = torch.autograd.grad(
+                    outputs=jump_mag,
+                    inputs=tz,
+                    grad_outputs=grad_output,
+                    create_graph=True,
+                    retain_graph=True,
+                    only_inputs=True,
+                )[0]
+                jacobian_wrt_input.append(
+                    gradients[:, 1:].flatten()
+                )  # Exclude the gradient with respect to t
+
+        # Stack the Jacobian rows to form the full Jacobian matrix
+        jacobian_wrt_input = torch.stack(jacobian_wrt_input, dim=0)
+
+
+        return jacobian_wrt_input
+
+    def jump_gradient_wrt_theta(self, t, x):
+        t = t.expand(x.size(0), 1)
+        tz = torch.cat([t, x], dim=1)
+        with torch.enable_grad():
+            tz = tz.detach().requires_grad_()
+            jump_mag = self._jump_magnitude(tz)
+            # Initialize the Jacobian list
+            jacobian_wrt_weights = []
+            # Compute the Jacobian
+            for i in range(jump_mag.size(1)):  # Iterate over each output element
+                grad_output = torch.zeros_like(jump_mag)
+                grad_output[:, i] = 1
+                gradients = torch.autograd.grad(
+                    outputs=jump_mag,
+                    inputs=self._jump_magnitude.parameters(),
+                    grad_outputs=grad_output,
+                    create_graph=True,
+                    retain_graph=True,
+                    only_inputs=True,
+                )
+                flattened_grads = torch.cat([grad.flatten() for grad in gradients])
+                jacobian_wrt_weights.append(flattened_grads)
+
+        # Stack the Jacobian rows to form the full Jacobian matrix
+        jacobian_wrt_weights = torch.stack(jacobian_wrt_weights, dim=0)
+
+        return jacobian_wrt_weights
+
+    def jump_gradient_wrt_time(self, t, x):
+        t = t.expand(x.size(0), 1)
+        tz = torch.cat([t, x], dim=1)
+        with torch.enable_grad():
+            tz = tz.detach().requires_grad_()
+            jump_mag = self._jump_magnitude(tz)
+            grad_t = torch.autograd.grad(
+                jump_mag, tz, torch.ones_like(jump_mag), retain_graph=True
+            )
+        # check if this is correct
+        return grad_t[0][:, 0]  # Return gradient w.r.t. time only
+
+    def jump_occurred_batch(self, t0, t1, batch_size):
+        A =  self._jump_intensity 
+        B= (t1 - t0).item()
+        expected_jumps = self._jump_intensity * (t1 - t0).item()
+        num_jumps = np.random.poisson([expected_jumps] * batch_size).tolist()
+        num_jumps = torch.tensor(num_jumps, device="mps")
+
+        jump_times_list = []
+        for b in range(batch_size):
+            num_jumps_b = int(num_jumps[b].item())
+            if num_jumps_b > 0:
+                jump_times = torch.sort(
+                    t0 + (t1 - t0) * torch.rand((num_jumps_b,), device="mps")
+                ).values
+                jump_times_list.append(jump_times)
+            else:
+                jump_times_list.append(torch.tensor([], device="mps"))
+
+        return jump_times_list
+        
 
 
 class Generator(torch.nn.Module):
@@ -239,82 +342,55 @@ def get_data(batch_size, device):
 ###################
 def plot(ts, generator, dataloader, num_plot_samples, plot_locs):
     # Get samples
-    (real_samples,) = next(iter(dataloader))
-    assert num_plot_samples <= real_samples.size(0)
-    real_samples = torchcde.LinearInterpolation(real_samples).evaluate(ts)
-    real_samples = real_samples[..., 1]
+    for _ in range(10):
 
-    with torch.no_grad():
-        generated_samples = generator(ts, real_samples.size(0)).cpu()
-    generated_samples = torchcde.LinearInterpolation(generated_samples).evaluate(ts)
-    generated_samples = generated_samples[..., 1]
+        (real_samples,) = next(iter(dataloader))
+        assert num_plot_samples <= real_samples.size(0)
+        real_samples = torchcde.LinearInterpolation(real_samples).evaluate(ts)
+        real_samples = real_samples[..., 1]
 
-    # # Plot histograms
-    # for prop in plot_locs:
-    #     time = int(prop * (real_samples.size(1) - 1))
-    #     real_samples_time = real_samples[:, time]
-    #     generated_samples_time = generated_samples[:, time]
-    #     _, bins, _ = plt.hist(
-    #         real_samples_time.cpu().numpy(),
-    #         bins=32,
-    #         alpha=0.7,
-    #         label="Real",
-    #         color="dodgerblue",
-    #         density=True,
-    #     )
-    #     bin_width = bins[1] - bins[0]
-    #     num_bins = int(
-    #         (generated_samples_time.max() - generated_samples_time.min()).item()
-    #         // bin_width
-    #     )
-    #     plt.hist(
-    #         generated_samples_time.cpu().numpy(),
-    #         bins=num_bins,
-    #         alpha=0.7,
-    #         label="Generated",
-    #         color="crimson",
-    #         density=True,
-    #     )
-    #     plt.legend()
-    #     plt.xlabel("Value")
-    #     plt.ylabel("Density")
-    #     plt.title(f"Marginal distribution at time {time}.")
-    #     plt.tight_layout()
-    #     plt.show()
+        with torch.no_grad():
+            generated_samples = generator(ts, real_samples.size(0)).cpu()
+        generated_samples = torchcde.LinearInterpolation(generated_samples).evaluate(ts)
+        generated_samples = generated_samples[..., 1]
 
-    real_samples = real_samples[:num_plot_samples]
-    generated_samples = generated_samples[:num_plot_samples]
+        real_samples = real_samples[:num_plot_samples]
+        generated_samples = generated_samples[:num_plot_samples]
 
-    # Plot samples
-    real_first = True
-    generated_first = True
-    for real_sample_ in real_samples:
-        kwargs = {"label": "Real"} if real_first else {}
-        plt.plot(
-            ts.detach().cpu().numpy(),
-            real_sample_.detach().cpu().numpy(),
-            color="dodgerblue",
-            linewidth=0.5,
-            alpha=0.7,
-            **kwargs,
+        # Plot samples
+        real_first = True
+        generated_first = True
+        for real_sample_ in real_samples:
+            kwargs = {"label": "Real"} if real_first else {}
+            plt.plot(
+                ts.detach().cpu().numpy(),
+                real_sample_.detach().cpu().numpy(),
+                color="dodgerblue",
+                linewidth=0.5,
+                alpha=0.7,
+                **kwargs,
+            )
+            real_first = False
+        for generated_sample_ in generated_samples:
+            kwargs = {"label": "Generated"} if generated_first else {}
+            plt.plot(
+                ts.detach().cpu().numpy(),
+                generated_sample_.detach().cpu().numpy(),
+                color="crimson",
+                linewidth=0.5,
+                alpha=0.7,
+                **kwargs,
+            )
+            generated_first = False
+        # plt.legend()
+        plt.title(
+            f"{num_plot_samples} samples from both real and generated distributions."
         )
-        real_first = False
-    for generated_sample_ in generated_samples:
-        kwargs = {"label": "Generated"} if generated_first else {}
-        plt.plot(
-            ts.detach().cpu().numpy(),
-            generated_sample_.detach().cpu().numpy(),
-            color="crimson",
-            linewidth=0.5,
-            alpha=0.7,
-            **kwargs,
-        )
-        generated_first = False
+        # Add gridlines with finer control
+        plt.grid(True)
 
-    plt.legend()
-    plt.title(f"{num_plot_samples} samples from both real and generated distributions.")
-    plt.tight_layout()
-    plt.show()
+        plt.tight_layout()
+    plt.savefig("pic_jump_w_6.pdf")
 
 
 def evaluate_loss(ts, batch_size, dataloader, generator, discriminator):
@@ -351,15 +427,15 @@ def main(
     # Training hyperparameters. Be prepared to tune these very carefully, as with any GAN.
     generator_lr=2e-3,  # Learning rate often needs careful tuning to the problem.
     discriminator_lr=1e-2,  # Learning rate often needs careful tuning to the problem.
-    batch_size=1024,  # Batch size.
+    batch_size=1,  # Batch size.
     steps=20,  # How many steps to train both generator and discriminator for.
     init_mult1=2,  # Changing the initial parameter size can help.
     init_mult2=0.5,  #
     weight_decay=0.01,  # Weight decay.
     swa_step_start=5000,  # When to start using stochastic weight averaging.
     # Evaluation and plotting hyperparameters
-    steps_per_print=10,  # How often to print the loss.
-    num_plot_samples=50,  # How many samples to use on the plots at the end.
+    steps_per_print=10000,  # How often to print the loss.
+    num_plot_samples=1,  # How many samples to use on the plots at the end.
     plot_locs=[0.0, 0.2, 0.4, 0.6, 0.8],
     load_best_weights=False,  # Whether to load the best weights at the end of training
 ):
@@ -385,110 +461,110 @@ def main(
         device
     )
     # Weight averaging really helps with GAN training.
-    averaged_generator = swa_utils.AveragedModel(generator)
-    averaged_discriminator = swa_utils.AveragedModel(discriminator)
+    # averaged_generator = swa_utils.AveragedModel(generator)
+    # averaged_discriminator = swa_utils.AveragedModel(discriminator)
 
-    # Picking a good initialisation is important!
-    # In this case these were picked by making the parameters for the t=0 part of the generator be roughly the right
-    # size that the untrained t=0 distribution has a similar variance to the t=0 data distribution.
-    # Then the func parameters were adjusted so that the t>0 distribution looked like it had about the right variance.
-    # What we're doing here is very crude -- one can definitely imagine smarter ways of doing things.
-    # (e.g. pretraining the t=0 distribution)
-    with torch.no_grad():
-        for param in generator._initial.parameters():
-            param *= init_mult1
-        for param in generator._func.parameters():
-            param *= init_mult2
+    # # Picking a good initialisation is important!
+    # # In this case these were picked by making the parameters for the t=0 part of the generator be roughly the right
+    # # size that the untrained t=0 distribution has a similar variance to the t=0 data distribution.
+    # # Then the func parameters were adjusted so that the t>0 distribution looked like it had about the right variance.
+    # # What we're doing here is very crude -- one can definitely imagine smarter ways of doing things.
+    # # (e.g. pretraining the t=0 distribution)
+    # with torch.no_grad():
+    #     for param in generator._initial.parameters():
+    #         param *= init_mult1
+    #     for param in generator._func.parameters():
+    #         param *= init_mult2
 
-    # Optimisers. Adadelta turns out to be a much better choice than SGD or Adam, interestingly.
-    generator_optimiser = torch.optim.Adadelta(
-        generator.parameters(), lr=generator_lr, weight_decay=weight_decay
-    )
-    discriminator_optimiser = torch.optim.Adadelta(
-        discriminator.parameters(), lr=discriminator_lr, weight_decay=weight_decay
-    )
+    # # Optimisers. Adadelta turns out to be a much better choice than SGD or Adam, interestingly.
+    # generator_optimiser = torch.optim.Adadelta(
+    #     generator.parameters(), lr=generator_lr, weight_decay=weight_decay
+    # )
+    # discriminator_optimiser = torch.optim.Adadelta(
+    #     discriminator.parameters(), lr=discriminator_lr, weight_decay=weight_decay
+    # )
 
-    # Track the lowest loss and corresponding steps
-    lowest_loss = float("inf")
+    # # Track the lowest loss and corresponding steps
+    # lowest_loss = float("inf")
 
-    # Train both generator and discriminator.
-    trange = tqdm.tqdm(range(steps))
-    for step in trange:
-        (real_samples,) = next(infinite_train_dataloader)
+    # # Train both generator and discriminator.
+    # trange = tqdm.tqdm(range(steps))
+    # for step in trange:
+    #     (real_samples,) = next(infinite_train_dataloader)
 
-        generated_samples = generator(ts, batch_size)
-        generated_score = discriminator(generated_samples)
-        real_score = discriminator(real_samples)
-        loss = generated_score - real_score
-        loss.backward()
+    #     generated_samples = generator(ts, batch_size)
+    #     generated_score = discriminator(generated_samples)
+    #     real_score = discriminator(real_samples)
+    #     loss = generated_score - real_score
+    #     loss.backward()
 
-        for param in generator.parameters():
-            param.grad *= -1
-        generator_optimiser.step()
-        discriminator_optimiser.step()
-        generator_optimiser.zero_grad()
-        discriminator_optimiser.zero_grad()
+    #     for param in generator.parameters():
+    #         param.grad *= -1
+    #     generator_optimiser.step()
+    #     discriminator_optimiser.step()
+    #     generator_optimiser.zero_grad()
+    #     discriminator_optimiser.zero_grad()
 
-        ###################
-        # We constrain the Lipschitz constant of the discriminator using carefully-chosen clipping (and the use of
-        # LipSwish activation functions).
-        ###################
-        with torch.no_grad():
-            for module in discriminator.modules():
-                if isinstance(module, torch.nn.Linear):
-                    lim = 1 / module.out_features
-                    module.weight.clamp_(-lim, lim)
+    #     ###################
+    #     # We constrain the Lipschitz constant of the discriminator using carefully-chosen clipping (and the use of
+    #     # LipSwish activation functions).
+    #     ###################
+    #     with torch.no_grad():
+    #         for module in discriminator.modules():
+    #             if isinstance(module, torch.nn.Linear):
+    #                 lim = 1 / module.out_features
+    #                 module.weight.clamp_(-lim, lim)
 
-        # Stochastic weight averaging typically improves performance.
-        if step > swa_step_start:
-            averaged_generator.update_parameters(generator)
-            averaged_discriminator.update_parameters(discriminator)
+    #     # Stochastic weight averaging typically improves performance.
+    #     if step > swa_step_start:
+    #         averaged_generator.update_parameters(generator)
+    #         averaged_discriminator.update_parameters(discriminator)
 
-        if (step % steps_per_print) == 0 or step == steps - 1:
-            total_unaveraged_loss = evaluate_loss(
-                ts, batch_size, train_dataloader, generator, discriminator
-            )
-            if step > swa_step_start:
-                total_averaged_loss = evaluate_loss(
-                    ts,
-                    batch_size,
-                    train_dataloader,
-                    averaged_generator.module,
-                    averaged_discriminator.module,
-                )
-                trange.write(
-                    f"Step: {step:3} Loss (unaveraged): {total_unaveraged_loss:.4f} "
-                    f"Loss (averaged): {total_averaged_loss:.4f}"
-                )
+    #     if (step % steps_per_print) == 0 or step == steps - 1:
+    #         total_unaveraged_loss = evaluate_loss(
+    #             ts, batch_size, train_dataloader, generator, discriminator
+    #         )
+    #         if step > swa_step_start:
+    #             total_averaged_loss = evaluate_loss(
+    #                 ts,
+    #                 batch_size,
+    #                 train_dataloader,
+    #                 averaged_generator.module,
+    #                 averaged_discriminator.module,
+    #             )
+    #             trange.write(
+    #                 f"Step: {step:3} Loss (unaveraged): {total_unaveraged_loss:.4f} "
+    #                 f"Loss (averaged): {total_averaged_loss:.4f}"
+    #             )
 
-                # Save the model weights if the averaged loss is the lowest
-                if total_averaged_loss < lowest_loss:
-                    lowest_loss = total_averaged_loss
-                    torch.save(
-                        averaged_generator.module.state_dict(),
-                        "weights/best_generator.pth",
-                    )
-                    torch.save(
-                        averaged_discriminator.module.state_dict(),
-                        "weights/best_discriminator.pth",
-                    )
-                    trange.write(
-                        f"New best model found at step {step}, saving model weights."
-                    )
-            else:
-                trange.write(
-                    f"Step: {step:3} Loss (unaveraged): {total_unaveraged_loss:.4f}"
-                )
+    #             # Save the model weights if the averaged loss is the lowest
+    #             if total_averaged_loss < lowest_loss:
+    #                 lowest_loss = total_averaged_loss
+    #                 torch.save(
+    #                     averaged_generator.module.state_dict(),
+    #                     "weights/best_generator.pth",
+    #                 )
+    #                 torch.save(
+    #                     averaged_discriminator.module.state_dict(),
+    #                     "weights/best_discriminator.pth",
+    #                 )
+    #                 trange.write(
+    #                     f"New best model found at step {step}, saving model weights."
+    #                 )
+    #         else:
+    #             trange.write(
+    #                 f"Step: {step:3} Loss (unaveraged): {total_unaveraged_loss:.4f}"
+    #             )
 
-                # Save the model weights if the unaveraged loss is the lowest
-                if total_unaveraged_loss < lowest_loss:
-                    lowest_loss = total_unaveraged_loss
-                    torch.save(generator.state_dict(), "weights/best_generator.pth")
-                    torch.save(
-                        discriminator.state_dict(), "weights/best_discriminator.pth"
-                    )
-                    trange.write(
-                        f"New best model found at step {step}, saving model weights."
+    #             # Save the model weights if the unaveraged loss is the lowest
+    #             if total_unaveraged_loss < lowest_loss:
+    #                 lowest_loss = total_unaveraged_loss
+    #                 torch.save(generator.state_dict(), "weights/best_generator.pth")
+    #                 torch.save(
+    #                     discriminator.state_dict(), "weights/best_discriminator.pth"
+    #                 )
+    #                 trange.write(
+    #                     f"New best model found at step {step}, saving model weights."
                     )
 
     # Load the best weights if the flag is set
