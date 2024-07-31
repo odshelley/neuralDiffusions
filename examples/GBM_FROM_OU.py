@@ -7,6 +7,9 @@ import torchsde
 import tqdm
 import numpy as np
 
+MU=1.
+SIGMA=.2
+INITIAL_PRICE=50
 
 class LipSwish(torch.nn.Module):
     def forward(self, x):
@@ -34,19 +37,19 @@ class MLP(torch.nn.Module):
         return self._model(x)
 
 
-class OUGeneratorFunc(torch.nn.Module):
+class GBMGeneratorFunc(torch.nn.Module):
     sde_type = "stratonovich"
     noise_type = "general"
 
     def __init__(
-        self, noise_size, hidden_size, mlp_size, num_layers, mu=0.2, theta=0.1
+        self, noise_size, hidden_size, mlp_size, num_layers, mu=MU, sigma=SIGMA
     ):
         super().__init__()
         self._noise_size = noise_size
         self._hidden_size = hidden_size
         self._output_size = 1
         self.register_buffer("mu", torch.as_tensor(mu))
-        self.register_buffer("theta", torch.as_tensor(theta))
+        self.register_buffer("sigma", torch.as_tensor(sigma))
         self._linear = torch.nn.Linear(
             hidden_size, self._output_size
         )  # Maps MLP to be 1 dimensional
@@ -61,12 +64,13 @@ class OUGeneratorFunc(torch.nn.Module):
         tx = torch.cat([t_expanded, x], dim=1)  # (t, S_t)
 
         # Drift components
-        drift = self.theta * (self.mu * t - x)
+        drift = self.mu * x / 64
         # Diffusion components
         diffusion = self._vol_mlp(tx)
-        diffusion = self._linear(diffusion)
+        diffusion = self._linear(diffusion) * x / 8
 
         return drift, diffusion.view(x.size(0), self._output_size, self._noise_size)
+    
 
 
 class Generator(torch.nn.Module):
@@ -87,7 +91,7 @@ class Generator(torch.nn.Module):
             initial_noise_size, hidden_size, mlp_size, num_layers, tanh=False
         )
         self._linear = torch.nn.Linear(hidden_size, 1)
-        self._func = OUGeneratorFunc(noise_size, hidden_size, mlp_size, num_layers)
+        self._func = GBMGeneratorFunc(noise_size, hidden_size, mlp_size, num_layers)
 
     def forward(self, ts, batch_size):
         # ts has shape (t_size,) and corresponds to the points we want to evaluate the SDE at.
@@ -96,8 +100,8 @@ class Generator(torch.nn.Module):
         # Actually solve the SDE.
         ###################
         init_noise = torch.randn(batch_size, self._initial_noise_size, device=ts.device)
-        x0 = self._initial(init_noise)
-        x0 = self._linear(x0)
+        x0 = self._initial(init_noise) 
+        x0 = self._linear(x0) + INITIAL_PRICE
 
         ###################
         # We use the reversible Heun method to get accurate gradients whilst using the adjoint method.
@@ -183,35 +187,25 @@ def get_data(batch_size, device):
     dataset_size = 1000
     t_size = 64
 
-    class OrnsteinUhlenbeckSDE(torch.nn.Module):
+    class GeometricBrownianMotionSDE(torch.nn.Module):
         sde_type = "ito"
         noise_type = "scalar"
 
-        def __init__(self, mu, theta, sigma):
+        def __init__(self, mu=MU, theta=None, sigma=SIGMA):
             super().__init__()
             self.register_buffer("mu", torch.as_tensor(mu))
-            self.register_buffer("theta", torch.as_tensor(theta))
             self.register_buffer("sigma", torch.as_tensor(sigma))
 
         def f(self, t, y):
-            return self.theta * (self.mu * t - y)
+            return self.mu * y / 64
 
         def g(self, t, y):
-            return self.sigma.expand(y.size(0), 1, 1) * (2 * t / t_size)
+            return (self.sigma * y / 8).unsqueeze(-1) #self.sigma.expand(y.size(0), 1, 1) * (2 * t / t_size)
 
-    ou_sde = OrnsteinUhlenbeckSDE(mu=0.2, theta=0.1, sigma=0.5).to(device)
-    y0 = torch.rand(dataset_size, device=device).unsqueeze(-1) * 2 - 1
+    ou_sde = GeometricBrownianMotionSDE().to(device)
+    y0 = torch.rand(dataset_size, device=device).unsqueeze(-1) * 2 - 1 + INITIAL_PRICE 
     ts = torch.linspace(0, t_size - 1, t_size, device=device)
     ys = torchsde.sdeint(ou_sde, y0, ts, dt=1e-1)
-
-    ###################
-    # Typically important to normalise data. Note that the data is normalised with respect to the statistics of the
-    # initial data, _not_ the whole time series. This seems to help the learning process, presumably because if the
-    # initial condition is wrong then it's pretty hard to learn the rest of the SDE correctly.
-    ###################
-    # y0_flat = ys[0].view(-1)
-    # y0_not_nan = y0_flat.masked_select(~torch.isnan(y0_flat))
-    # ys = (ys - y0_not_nan.mean()) / y0_not_nan.std()
 
     ###################
     # As discussed, time must be included as a channel for the discriminator.
@@ -323,21 +317,6 @@ def plot(ts, generator, dataloader, num_plot_samples, plot_locs):
     plt.show()
 
 
-###################
-# Now do normal GAN training, and plot the results.
-#
-# GANs are famously tricky and SDEs trained as GANs are no exception. Hopefully you can learn from our experience and
-# get these working faster than we did -- we found that several tricks were often helpful to get this working in a
-# reasonable fashion:
-# - Stochastic weight averaging (average out the oscillations in GAN training).
-# - Weight decay (reduce the oscillations in GAN training).
-# - Final tanh nonlinearities in the architectures of the vector fields, as above. (To avoid the model blowing up.)
-# - Adadelta (interestingly seems to be a lot better than either SGD or Adam).
-# - Choosing a good learning rate (always important).
-# - Scaling the weights at initialisation to be roughly the right size (chosen through empirical trial-and-error).
-###################
-
-
 def evaluate_loss(ts, batch_size, dataloader, generator, discriminator):
     with torch.no_grad():
         total_samples = 0
@@ -373,7 +352,7 @@ def main(
     generator_lr=2e-3,  # Learning rate often needs careful tuning to the problem.
     discriminator_lr=1e-2,  # Learning rate often needs careful tuning to the problem.
     batch_size=1024,  # Batch size.
-    steps=2,  # How many steps to train both generator and discriminator for.
+    steps=20,  # How many steps to train both generator and discriminator for.
     init_mult1=2,  # Changing the initial parameter size can help.
     init_mult2=0.5,  #
     weight_decay=0.01,  # Weight decay.

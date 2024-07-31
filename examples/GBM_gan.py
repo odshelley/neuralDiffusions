@@ -7,6 +7,9 @@ import torchsde
 import tqdm
 import numpy as np
 
+INITIAL_PRICE=50
+MU=1.
+SIGMA=.5
 
 class LipSwish(torch.nn.Module):
     def forward(self, x):
@@ -17,7 +20,7 @@ class MLP(torch.nn.Module):
     def __init__(self, in_size, out_size, mlp_size, num_layers, tanh):
         super().__init__()
 
-        model = [torch.nn.Linear(in_size, mlp_size), LipSwish()]
+        model=[torch.nn.Linear(in_size, mlp_size), LipSwish()]
         for _ in range(num_layers - 1):
             model.append(torch.nn.Linear(mlp_size, mlp_size))
             ###################
@@ -28,46 +31,41 @@ class MLP(torch.nn.Module):
         model.append(torch.nn.Linear(mlp_size, out_size))
         if tanh:
             model.append(torch.nn.Tanh())
-        self._model = torch.nn.Sequential(*model)
+        self._model=torch.nn.Sequential(*model)
 
     def forward(self, x):
         return self._model(x)
 
 
-class OUGeneratorFunc(torch.nn.Module):
-    sde_type = "stratonovich"
-    noise_type = "general"
+class GBMGeneratorFunc(torch.nn.Module):
+    sde_type="stratonovich"
+    noise_type="general"
 
     def __init__(
-        self, noise_size, hidden_size, mlp_size, num_layers, mu=0.2, theta=0.1
+        self, noise_size, hidden_size, mlp_size, num_layers, mu=MU
     ):
         super().__init__()
-        self._noise_size = noise_size
-        self._hidden_size = hidden_size
-        self._output_size = 1
+        self._noise_size=noise_size
+        self._hidden_size=hidden_size
+        self._output_size=1
         self.register_buffer("mu", torch.as_tensor(mu))
-        self.register_buffer("theta", torch.as_tensor(theta))
-        self._linear = torch.nn.Linear(
+        self._linear=torch.nn.Linear(
             hidden_size, self._output_size
         )  # Maps MLP to be 1 dimensional
-
-        self._vol_mlp = MLP(
+        self._vol_mlp=MLP(
             1 + 1, hidden_size, mlp_size, num_layers, tanh=True
         )  # MLP for volatility of volatility
 
     def f_and_g(self, t, x):
-        # x consists of [S_t, v_t]
-        t_expanded = t.expand(x.size(0), 1)
-        tx = torch.cat([t_expanded, x], dim=1)  # (t, S_t)
+        t_expanded=t.expand(x.size(0), 1)
+        tx=torch.cat([t_expanded, x], dim=1)  # (t, S_t)
 
-        # Drift components
-        drift = self.theta * (self.mu * t - x)
-        # Diffusion components
-        diffusion = self._vol_mlp(tx)
-        diffusion = self._linear(diffusion)
+        drift= self.mu * x
 
-        return drift, diffusion.view(x.size(0), self._output_size, self._noise_size)
+        diffusion=self._vol_mlp(tx)
+        diffusion=self._linear(diffusion) * x
 
+        return drift/64, diffusion.view(x.size(0), self._output_size, self._noise_size)/8
 
 class Generator(torch.nn.Module):
     def __init__(
@@ -80,14 +78,10 @@ class Generator(torch.nn.Module):
         num_layers,
     ):
         super().__init__()
-        self._initial_noise_size = initial_noise_size
-        self._hidden_size = hidden_size
-        self.data_size = 1
-        self._initial = MLP(
-            initial_noise_size, hidden_size, mlp_size, num_layers, tanh=False
-        )
-        self._linear = torch.nn.Linear(hidden_size, 1)
-        self._func = OUGeneratorFunc(noise_size, hidden_size, mlp_size, num_layers)
+        self._initial_noise_size=initial_noise_size
+        self._hidden_size=hidden_size
+        self.data_size=data_size
+        self._func=GBMGeneratorFunc(noise_size, hidden_size, mlp_size, num_layers)
 
     def forward(self, ts, batch_size):
         # ts has shape (t_size,) and corresponds to the points we want to evaluate the SDE at.
@@ -95,14 +89,12 @@ class Generator(torch.nn.Module):
         ###################
         # Actually solve the SDE.
         ###################
-        init_noise = torch.randn(batch_size, self._initial_noise_size, device=ts.device)
-        x0 = self._initial(init_noise)
-        x0 = self._linear(x0)
+        x0 = torch.full((batch_size, 1), INITIAL_PRICE, device=ts.device)
 
         ###################
         # We use the reversible Heun method to get accurate gradients whilst using the adjoint method.
         ###################
-        xs = torchsde.sdeint_adjoint(
+        xs=torchsde.sdeint_adjoint(
             self._func,
             x0,
             ts,
@@ -110,23 +102,23 @@ class Generator(torch.nn.Module):
             dt=1.0,
             adjoint_method="adjoint_reversible_heun",
         )
-        ys = xs.transpose(0, 1)
+        ys=xs.transpose(0, 1)
 
         ###################
         # Normalise the data to the form that the discriminator expects, in particular including time as a channel.
         ###################
-        ts = ts.unsqueeze(0).unsqueeze(-1).expand(batch_size, ts.size(0), 1)
+        ts=ts.unsqueeze(0).unsqueeze(-1).expand(batch_size, ts.size(0), 1)
         return torchcde.linear_interpolation_coeffs(torch.cat([ts, ys], dim=2))
 
 
 class DiscriminatorFunc(torch.nn.Module):
     def __init__(self, data_size, hidden_size, mlp_size, num_layers):
         super().__init__()
-        self._data_size = data_size
-        self._hidden_size = hidden_size
+        self._data_size=data_size
+        self._hidden_size=hidden_size
 
         # tanh is important for model performance
-        self._module = MLP(
+        self._module=MLP(
             1 + hidden_size,
             hidden_size * (1 + data_size),
             mlp_size,
@@ -137,8 +129,8 @@ class DiscriminatorFunc(torch.nn.Module):
     def forward(self, t, h):
         # t has shape ()
         # h has shape (batch_size, hidden_size)
-        t = t.expand(h.size(0), 1)
-        th = torch.cat([t, h], dim=1)
+        t=t.expand(h.size(0), 1)
+        th=torch.cat([t, h], dim=1)
         return self._module(th).view(h.size(0), self._hidden_size, 1 + self._data_size)
 
 
@@ -146,11 +138,11 @@ class Discriminator(torch.nn.Module):
     def __init__(self, data_size, hidden_size, mlp_size, num_layers):
         super().__init__()
 
-        self._initial = MLP(
+        self._initial=MLP(
             1 + data_size, hidden_size, mlp_size, num_layers, tanh=False
         )
-        self._func = DiscriminatorFunc(data_size, hidden_size, mlp_size, num_layers)
-        self._readout = torch.nn.Linear(hidden_size, 1)
+        self._func=DiscriminatorFunc(data_size, hidden_size, mlp_size, num_layers)
+        self._readout=torch.nn.Linear(hidden_size, 1)
 
     def forward(self, ys_coeffs):
         # ys_coeffs has shape (batch_size, t_size, 1 + data_size)
@@ -158,10 +150,10 @@ class Discriminator(torch.nn.Module):
         # channel: in particular this makes handling irregular data quite easy, when the times may be different between
         # different samples in the batch.
 
-        Y = torchcde.LinearInterpolation(ys_coeffs)
-        Y0 = Y.evaluate(Y.interval[0])
-        h0 = self._initial(Y0)
-        hs = torchcde.cdeint(
+        Y=torchcde.LinearInterpolation(ys_coeffs)
+        Y0=Y.evaluate(Y.interval[0])
+        h0=self._initial(Y0)
+        hs=torchcde.cdeint(
             Y,
             self._func,
             h0,
@@ -172,7 +164,7 @@ class Discriminator(torch.nn.Module):
             adjoint_method="adjoint_reversible_heun",
             adjoint_params=(ys_coeffs,) + tuple(self._func.parameters()),
         )
-        score = self._readout(hs[:, -1])
+        score=self._readout(hs[:, -1])
         return score.mean()
 
 
@@ -180,43 +172,45 @@ class Discriminator(torch.nn.Module):
 # Generate some data. For this example we generate some synthetic data from a time-dependent Ornstein-Uhlenbeck SDE.
 ###################
 def get_data(batch_size, device):
-    dataset_size = 1000
-    t_size = 64
+    dataset_size=1000
+    t_size=64
+    sqrt_t_size=8
 
-    class OrnsteinUhlenbeckSDE(torch.nn.Module):
-        sde_type = "ito"
-        noise_type = "scalar"
+    class GBM_SDE(torch.nn.Module):
+        sde_type="ito"
+        noise_type="scalar"
 
-        def __init__(self, mu, theta, sigma):
+        def __init__(self, mu=MU, sigma=SIGMA):
             super().__init__()
             self.register_buffer("mu", torch.as_tensor(mu))
-            self.register_buffer("theta", torch.as_tensor(theta))
             self.register_buffer("sigma", torch.as_tensor(sigma))
 
         def f(self, t, y):
-            return self.theta * (self.mu * t - y)
+            return self.mu * y / t_size
 
         def g(self, t, y):
-            return self.sigma.expand(y.size(0), 1, 1) * (2 * t / t_size)
+            return (self.sigma * y / sqrt_t_size ).unsqueeze(-1)
+        
+    ou_sde=GBM_SDE(mu=MU, sigma=SIGMA).to(device)
+    y0=torch.tensor([[INITIAL_PRICE]] * dataset_size, device=device)
 
-    ou_sde = OrnsteinUhlenbeckSDE(mu=0.2, theta=0.1, sigma=0.5).to(device)
-    y0 = torch.rand(dataset_size, device=device).unsqueeze(-1) * 2 - 1
-    ts = torch.linspace(0, t_size - 1, t_size, device=device)
-    ys = torchsde.sdeint(ou_sde, y0, ts, dt=1e-1)
+    # y0=10 * torch.rand(dataset_size, device=device).unsqueeze(-1) * 2 - 1
+    ts=torch.linspace(0, t_size - 1, t_size, device=device)
+    ys=torchsde.sdeint(ou_sde, y0, ts, dt=1e-1)
 
     ###################
     # Typically important to normalise data. Note that the data is normalised with respect to the statistics of the
     # initial data, _not_ the whole time series. This seems to help the learning process, presumably because if the
     # initial condition is wrong then it's pretty hard to learn the rest of the SDE correctly.
     ###################
-    # y0_flat = ys[0].view(-1)
-    # y0_not_nan = y0_flat.masked_select(~torch.isnan(y0_flat))
-    # ys = (ys - y0_not_nan.mean()) / y0_not_nan.std()
+    # y0_flat=ys[0].view(-1)
+    # y0_not_nan=y0_flat.masked_select(~torch.isnan(y0_flat))
+    # ys=(ys - y0_not_nan.mean()) / y0_not_nan.std()
 
     ###################
     # As discussed, time must be included as a channel for the discriminator.
     ###################
-    ys = torch.cat(
+    ys=torch.cat(
         [
             ts.unsqueeze(0).unsqueeze(-1).expand(dataset_size, t_size, 1),
             ys.transpose(0, 1),
@@ -228,12 +222,12 @@ def get_data(batch_size, device):
     ###################
     # Package up.
     ###################
-    data_size = (
+    data_size=(
         ys.size(-1) - 1
     )  # How many channels the data has (not including time, hence the minus one).
-    ys_coeffs = torchcde.linear_interpolation_coeffs(ys)  # as per neural CDEs.
-    dataset = torch.utils.data.TensorDataset(ys_coeffs)
-    dataloader = torch.utils.data.DataLoader(
+    ys_coeffs=torchcde.linear_interpolation_coeffs(ys)  # as per neural CDEs.
+    dataset=torch.utils.data.TensorDataset(ys_coeffs)
+    dataloader=torch.utils.data.DataLoader(
         dataset, batch_size=batch_size, shuffle=True
     )
 
@@ -245,22 +239,22 @@ def get_data(batch_size, device):
 ###################
 def plot(ts, generator, dataloader, num_plot_samples, plot_locs):
     # Get samples
-    (real_samples,) = next(iter(dataloader))
-    assert num_plot_samples <= real_samples.size(0)
-    real_samples = torchcde.LinearInterpolation(real_samples).evaluate(ts)
-    real_samples = real_samples[..., 1]
+    (real_samples,)=next(iter(dataloader))
+    assert num_plot_samples <=real_samples.size(0)
+    # real_samples=torchcde.LinearInterpolation(real_samples).evaluate(ts)
+    real_samples=real_samples[..., 1]
 
     with torch.no_grad():
-        generated_samples = generator(ts, real_samples.size(0)).cpu()
-    generated_samples = torchcde.LinearInterpolation(generated_samples).evaluate(ts)
-    generated_samples = generated_samples[..., 1]
+        generated_samples=generator(ts, real_samples.size(0)).cpu()
+    # generated_samples=torchcde.LinearInterpolation(generated_samples).evaluate(ts)
+    generated_samples=generated_samples[..., 1]
 
     # # Plot histograms
     # for prop in plot_locs:
-    #     time = int(prop * (real_samples.size(1) - 1))
-    #     real_samples_time = real_samples[:, time]
-    #     generated_samples_time = generated_samples[:, time]
-    #     _, bins, _ = plt.hist(
+    #     time=int(prop * (real_samples.size(1) - 1))
+    #     real_samples_time=real_samples[:, time]
+    #     generated_samples_time=generated_samples[:, time]
+    #     _, bins, _=plt.hist(
     #         real_samples_time.cpu().numpy(),
     #         bins=32,
     #         alpha=0.7,
@@ -268,8 +262,8 @@ def plot(ts, generator, dataloader, num_plot_samples, plot_locs):
     #         color="dodgerblue",
     #         density=True,
     #     )
-    #     bin_width = bins[1] - bins[0]
-    #     num_bins = int(
+    #     bin_width=bins[1] - bins[0]
+    #     num_bins=int(
     #         (generated_samples_time.max() - generated_samples_time.min()).item()
     #         // bin_width
     #     )
@@ -288,14 +282,14 @@ def plot(ts, generator, dataloader, num_plot_samples, plot_locs):
     #     plt.tight_layout()
     #     plt.show()
 
-    real_samples = real_samples[:num_plot_samples]
-    generated_samples = generated_samples[:num_plot_samples]
+    real_samples=real_samples[:num_plot_samples]
+    generated_samples=generated_samples[:num_plot_samples]
 
     # Plot samples
-    real_first = True
-    generated_first = True
+    real_first=True
+    generated_first=True
     for real_sample_ in real_samples:
-        kwargs = {"label": "Real"} if real_first else {}
+        kwargs={"label": "Real"} if real_first else {}
         plt.plot(
             ts.detach().cpu().numpy(),
             real_sample_.detach().cpu().numpy(),
@@ -304,9 +298,9 @@ def plot(ts, generator, dataloader, num_plot_samples, plot_locs):
             alpha=0.7,
             **kwargs,
         )
-        real_first = False
+        real_first=False
     for generated_sample_ in generated_samples:
-        kwargs = {"label": "Generated"} if generated_first else {}
+        kwargs={"label": "Generated"} if generated_first else {}
         plt.plot(
             ts.detach().cpu().numpy(),
             generated_sample_.detach().cpu().numpy(),
@@ -315,11 +309,12 @@ def plot(ts, generator, dataloader, num_plot_samples, plot_locs):
             alpha=0.7,
             **kwargs,
         )
-        generated_first = False
+        generated_first=False
 
     plt.legend()
     plt.title(f"{num_plot_samples} samples from both real and generated distributions.")
     plt.tight_layout()
+    plt.savefig("pic_GBM.pdf")
     plt.show()
 
 
@@ -340,23 +335,23 @@ def plot(ts, generator, dataloader, num_plot_samples, plot_locs):
 
 def evaluate_loss(ts, batch_size, dataloader, generator, discriminator):
     with torch.no_grad():
-        total_samples = 0
-        total_loss = 0
+        total_samples=0
+        total_loss=0
         for (real_samples,) in dataloader:
-            generated_samples = generator(ts, batch_size)
-            generated_score = discriminator(generated_samples)
-            real_score = discriminator(real_samples)
-            loss = generated_score - real_score
-            total_samples += batch_size
-            total_loss += loss.item() * batch_size
+            generated_samples=generator(ts, batch_size)
+            generated_score=discriminator(generated_samples)
+            real_score=discriminator(real_samples)
+            loss=generated_score - real_score
+            total_samples +=batch_size
+            total_loss +=loss.item() * batch_size
     return total_loss / total_samples
 
 
 def load_weights(
     generator,
     discriminator,
-    generator_path="weights/best_generator_1.pth",
-    discriminator_path="weights/best_discriminator_1.pth",
+    generator_path="best_generator_1.pth",
+    discriminator_path="best_discriminator_1.pth",
 ):
     generator.load_state_dict(torch.load(generator_path, weights_only=True))
     discriminator.load_state_dict(torch.load(discriminator_path, weights_only=True))
@@ -373,9 +368,9 @@ def main(
     generator_lr=2e-3,  # Learning rate often needs careful tuning to the problem.
     discriminator_lr=1e-2,  # Learning rate often needs careful tuning to the problem.
     batch_size=1024,  # Batch size.
-    steps=2,  # How many steps to train both generator and discriminator for.
+    steps=10,  # How many steps to train both generator and discriminator for.
     init_mult1=2,  # Changing the initial parameter size can help.
-    init_mult2=0.5,  #
+    init_mult2=2.,  #
     weight_decay=0.01,  # Weight decay.
     swa_step_start=5000,  # When to start using stochastic weight averaging.
     # Evaluation and plotting hyperparameters
@@ -384,30 +379,30 @@ def main(
     plot_locs=[0.0, 0.2, 0.4, 0.6, 0.8],
     load_best_weights=False,  # Whether to load the best weights at the end of training
 ):
-    # is_cuda = torch.cuda.is_available()
-    # device = "cuda" if is_cuda else "cpu"
+    # is_cuda=torch.cuda.is_available()
+    # device="cuda" if is_cuda else "cpu"
     # if not is_cuda:
     #     print(
     #         "Warning: CUDA not available; falling back to CPU but this is likely to be very slow."
     #     )
-    device = 'mps'
+    device='mps'
 
     # Data
-    ts, data_size, train_dataloader = get_data(batch_size=batch_size, device=device)
-    infinite_train_dataloader = (
+    ts, data_size, train_dataloader=get_data(batch_size=batch_size, device=device)
+    infinite_train_dataloader=(
         elem for it in iter(lambda: train_dataloader, None) for elem in it
     )
 
     # Models
-    generator = Generator(
+    generator=Generator(
         data_size, initial_noise_size, noise_size, hidden_size, mlp_size, num_layers
     ).to(device)
-    discriminator = Discriminator(data_size, hidden_size, mlp_size, num_layers).to(
+    discriminator=Discriminator(data_size, hidden_size, mlp_size, num_layers).to(
         device
     )
     # Weight averaging really helps with GAN training.
-    averaged_generator = swa_utils.AveragedModel(generator)
-    averaged_discriminator = swa_utils.AveragedModel(discriminator)
+    averaged_generator=swa_utils.AveragedModel(generator)
+    averaged_discriminator=swa_utils.AveragedModel(discriminator)
 
     # Picking a good initialisation is important!
     # In this case these were picked by making the parameters for the t=0 part of the generator be roughly the right
@@ -416,35 +411,35 @@ def main(
     # What we're doing here is very crude -- one can definitely imagine smarter ways of doing things.
     # (e.g. pretraining the t=0 distribution)
     with torch.no_grad():
-        for param in generator._initial.parameters():
-            param *= init_mult1
+        # for param in generator._initial.parameters():
+        #     param *=init_mult1
         for param in generator._func.parameters():
-            param *= init_mult2
+            param *=init_mult2
 
     # Optimisers. Adadelta turns out to be a much better choice than SGD or Adam, interestingly.
-    generator_optimiser = torch.optim.Adadelta(
+    generator_optimiser=torch.optim.Adadelta(
         generator.parameters(), lr=generator_lr, weight_decay=weight_decay
     )
-    discriminator_optimiser = torch.optim.Adadelta(
+    discriminator_optimiser=torch.optim.Adadelta(
         discriminator.parameters(), lr=discriminator_lr, weight_decay=weight_decay
     )
 
     # Track the lowest loss and corresponding steps
-    lowest_loss = float("inf")
+    lowest_loss=float("inf")
 
     # Train both generator and discriminator.
-    trange = tqdm.tqdm(range(steps))
+    trange=tqdm.tqdm(range(steps))
     for step in trange:
-        (real_samples,) = next(infinite_train_dataloader)
+        (real_samples,)=next(infinite_train_dataloader)
 
-        generated_samples = generator(ts, batch_size)
-        generated_score = discriminator(generated_samples)
-        real_score = discriminator(real_samples)
-        loss = generated_score - real_score
+        generated_samples=generator(ts, batch_size)
+        generated_score=discriminator(generated_samples)
+        real_score=discriminator(real_samples)
+        loss=generated_score - real_score
         loss.backward()
 
         for param in generator.parameters():
-            param.grad *= -1
+            param.grad *=-1
         generator_optimiser.step()
         discriminator_optimiser.step()
         generator_optimiser.zero_grad()
@@ -457,7 +452,7 @@ def main(
         with torch.no_grad():
             for module in discriminator.modules():
                 if isinstance(module, torch.nn.Linear):
-                    lim = 1 / module.out_features
+                    lim=1 / module.out_features
                     module.weight.clamp_(-lim, lim)
 
         # Stochastic weight averaging typically improves performance.
@@ -465,12 +460,12 @@ def main(
             averaged_generator.update_parameters(generator)
             averaged_discriminator.update_parameters(discriminator)
 
-        if (step % steps_per_print) == 0 or step == steps - 1:
-            total_unaveraged_loss = evaluate_loss(
+        if (step % steps_per_print)==0 or step==steps - 1:
+            total_unaveraged_loss=evaluate_loss(
                 ts, batch_size, train_dataloader, generator, discriminator
             )
             if step > swa_step_start:
-                total_averaged_loss = evaluate_loss(
+                total_averaged_loss=evaluate_loss(
                     ts,
                     batch_size,
                     train_dataloader,
@@ -484,14 +479,14 @@ def main(
 
                 # Save the model weights if the averaged loss is the lowest
                 if total_averaged_loss < lowest_loss:
-                    lowest_loss = total_averaged_loss
+                    lowest_loss=total_averaged_loss
                     torch.save(
                         averaged_generator.module.state_dict(),
-                        "weights/best_generator.pth",
+                        "best_generator.pth",
                     )
                     torch.save(
                         averaged_discriminator.module.state_dict(),
-                        "weights/best_discriminator.pth",
+                        "best_discriminator.pth",
                     )
                     trange.write(
                         f"New best model found at step {step}, saving model weights."
@@ -503,10 +498,10 @@ def main(
 
                 # Save the model weights if the unaveraged loss is the lowest
                 if total_unaveraged_loss < lowest_loss:
-                    lowest_loss = total_unaveraged_loss
-                    torch.save(generator.state_dict(), "weights/best_generator.pth")
+                    lowest_loss=total_unaveraged_loss
+                    torch.save(generator.state_dict(), "best_generator.pth")
                     torch.save(
-                        discriminator.state_dict(), "weights/best_discriminator.pth"
+                        discriminator.state_dict(), "best_discriminator.pth"
                     )
                     trange.write(
                         f"New best model found at step {step}, saving model weights."
@@ -516,12 +511,12 @@ def main(
     if load_best_weights:
         load_weights(generator, discriminator)
 
-    time, dimension_of_SDE, test_dataloader = get_data(
+    time, dimension_of_SDE, test_dataloader=get_data(
         batch_size=batch_size, device=device
     )
 
     plot(ts, generator, test_dataloader, num_plot_samples, plot_locs)
 
 
-if __name__ == "__main__":
+if __name__=="__main__":
     fire.Fire(main)

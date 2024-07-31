@@ -69,12 +69,6 @@ class MLP(torch.nn.Module):
     def forward(self, x):
         return self._model(x)
 
-
-###################
-# Now we define the SDEs.
-#
-# We begin by defining the generator SDE.
-###################
 class GeneratorFunc(torch.nn.Module):
     sde_type = 'stratonovich'
     noise_type = 'general'
@@ -92,17 +86,21 @@ class GeneratorFunc(torch.nn.Module):
         # If you have problems with very high drift/diffusions then consider scaling these so that they squash to e.g.
         # [-3, 3] rather than [-1, 1].
         ###################
-        self._drift = MLP(1 + hidden_size, hidden_size, mlp_size, num_layers, tanh=True)
-        self._diffusion = MLP(1 + hidden_size, hidden_size * noise_size, mlp_size, num_layers, tanh=True)
+        # self._drift = MLP(1 + hidden_size, hidden_size, mlp_size, num_layers, tanh=True)
+        # self._diffusion = MLP(1 + hidden_size, hidden_size * noise_size, mlp_size, num_layers, tanh=True)
         self._jump_magnitude = MLP(1 + hidden_size, hidden_size, mlp_size, num_layers, tanh=True)
 
 
     def f_and_g(self, t, x):
         # t has shape ()
         # x has shape (batch_size, hidden_size)
+        # t = t.expand(x.size(0), 1)
+        # tx = torch.cat([t, x], dim=1)
+        # return self._drift(tx), self._diffusion(tx).view(x.size(0), self._hidden_size, self._noise_size)
         t = t.expand(x.size(0), 1)
-        tx = torch.cat([t, x], dim=1)
-        return self._drift(tx), self._diffusion(tx).view(x.size(0), self._hidden_size, self._noise_size)
+        drift = torch.zeros_like(x, device=x.device)  # Drift coefficient is always zero
+        diffusion = torch.zeros(x.size(0), self._hidden_size, self._noise_size, device=x.device)  # Diffusion coefficient is always zero
+        return drift, diffusion
 
 
     def jump_magnitude(self, t, x):
@@ -132,15 +130,8 @@ class GeneratorFunc(torch.nn.Module):
                 )[0]
                 jacobian_wrt_input.append(gradients[:, 1:].flatten())  # Exclude the gradient with respect to t
 
-        # Stack the Jacobian rows to form the full Jacobian matrix
         jacobian_wrt_input = torch.stack(jacobian_wrt_input, dim=0)
-        # with torch.enable_grad():
-        #     tz = tz.detach().requires_grad_()
-        #     jump_mag = self._jump_magnitude(tz)
-        #     grad_z = torch.autograd.grad(jump_mag, tz, torch.ones_like(jump_mag), retain_graph=True)
-        # deb=True
-        # return grad_z[0][:, 1:]
-
+     
         return jacobian_wrt_input
 
     def jump_gradient_wrt_theta(self, t, x):
@@ -196,7 +187,6 @@ class GeneratorFunc(torch.nn.Module):
                 jump_times_list.append(torch.tensor([], device='mps'))
         
         return jump_times_list
-
         
 class Generator(torch.nn.Module):
     def __init__(
@@ -338,7 +328,7 @@ def get_data(batch_size, device):
     for jump_times in jump_times_list:
         path = torch.zeros(t_size, device=device)
         for jump_time in jump_times:
-            path[int(jump_time.item()):] += .9
+            path[int(jump_time.item()):] += 1
         poisson_paths.append(path)
 
     poisson_paths = torch.stack(poisson_paths)
@@ -418,7 +408,7 @@ def plot(ts, generator, dataloader, num_plot_samples, plot_locs):
         plt.grid(True)
 
         plt.tight_layout()
-    plt.savefig("pic.pdf")
+    plt.savefig("pic_jump_w.pdf")
 
 
 ###################
@@ -461,7 +451,7 @@ def main(
         generator_lr=2e-4,      # Learning rate often needs careful tuning to the problem.
         discriminator_lr=1e-3,  # Learning rate often needs careful tuning to the problem.
         batch_size=1,        # Batch size.
-        steps=2,            # How many steps to train both generator and discriminator for.
+        steps=20,            # How many steps to train both generator and discriminator for.
         init_mult1=3,           # Changing the initial parameter size can help.
         init_mult2=0.5,         #
         weight_decay=0.01,      # Weight decay.

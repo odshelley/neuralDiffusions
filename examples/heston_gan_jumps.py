@@ -32,11 +32,12 @@ python -m examples.sde_gan
 import fire
 import matplotlib.pyplot as plt
 import torch
-import torch.nn as nn
 import torch.optim.swa_utils as swa_utils
 import torchcde
 import torchsde
 import tqdm
+import numpy as np
+import math
 
 MU = 0.5
 KAPPA = 2.0
@@ -50,8 +51,6 @@ INITIAL_VOL = 0.1
 ###################
 # First some standard helper objects.
 ###################
-
-
 
 
 class LipSwish(torch.nn.Module):
@@ -94,15 +93,19 @@ class HestonGeneratorFunc(torch.nn.Module):
         theta=THETA,
         rho=RHO,
         min_volatility=0.0001,
+        jump_intensity=1, 
+        has_jumps=True
     ):
         super().__init__()
         self._noise_size = noise_size
         self._hidden_size = hidden_size
+        self.register_buffer("kappa", torch.as_tensor(kappa))
+        self.register_buffer("theta", torch.as_tensor(theta))
         self.register_buffer("rho", torch.as_tensor(rho))
-        self.kappa=nn.Parameter(torch.empty(1))  # Make kappa learnable
-        self.theta=nn.Parameter(torch.empty(1))
         self._linear = torch.nn.Linear(hidden_size, 1)  # Maps MLP to be 1 dimensional
         self.min_volatility = min_volatility
+        self._jump_intensity = jump_intensity  # Rate parameter for the Poisson process
+        self.has_jumps=has_jumps
         # Construct the Cholesky decomposition of the correlation matrix
 
         self._drift_mlp = MLP(
@@ -111,10 +114,10 @@ class HestonGeneratorFunc(torch.nn.Module):
         self._vol_of_vol_mlp = MLP(
             1 + 1, hidden_size, mlp_size, num_layers, tanh=True
         )  # MLP for volatility of volatility
+        self._jump_magnitude = MLP(
+            1 + 1, hidden_size, mlp_size, num_layers, tanh=True
+        )
 
-        # Initialize kappa and theta with random values
-        nn.init.uniform_(self.kappa, a=0.5, b=3.0)  # Initialize kappa with values between 0.5 and 3.0
-        nn.init.uniform_(self.theta, a=0.01, b=0.1)  # Initialize theta with values between 0.01 and 0.1
 
     def f_and_g(self, t, x):
         # dS=self.mu * S
@@ -165,8 +168,103 @@ class HestonGeneratorFunc(torch.nn.Module):
 
         drift = torch.cat([drift_S, drift_v], dim=1)
         return drift / 36, G / 6
+    
+    def jump_magnitude(self, t, x):
+        S, V = x[:, 0:1], x[:, 1:2]
+        t_expanded = t.expand(x.size(0), 1)
+        tx_s = torch.cat([t_expanded, S], dim=1)  # (t, S_t)
+        tx_v = torch.cat([t_expanded, V], dim=1)
 
+        jump_mags_S = self._jump_magnitude(tx_s)
+        jump_mags_S = self._linear(jump_mags_S) 
+        jump_mags_V = torch.zeros_like(V)
 
+        jumps = torch.cat([jump_mags_S, jump_mags_V], dim=1)
+        return jumps
+    
+    def jump_gradient(self, t, x):
+        S, V = x[:, 0:1], x[:, 1:2]
+        t_expanded = t.expand(x.size(0), 1)
+        with torch.enable_grad():
+            tx_s = torch.cat([t_expanded, S], dim=1).requires_grad_() # (t, S_t)
+            jump_mags_V = torch.zeros_like(V)
+            jump_mag_S = self._jump_magnitude(tx_s)
+            jump_mag = torch.cat([jump_mag_S, jump_mags_V], dim=1)
+
+            # Initialize the Jacobian list
+            jacobian_wrt_input = []
+            # Compute the Jacobian
+            for i in range(jump_mag.size(1)):  # Iterate over each output element
+                grad_output = torch.zeros_like(jump_mag)
+                grad_output[:, i] = 1
+                gradients = torch.autograd.grad(
+                    outputs=jump_mag,
+                    inputs=tz,
+                    grad_outputs=grad_output,
+                    create_graph=True,
+                    retain_graph=True,
+                    only_inputs=True
+                )[0]
+                jacobian_wrt_input.append(gradients[:, 1:].flatten())  # Exclude the gradient with respect to t
+
+        jacobian_wrt_input = torch.stack(jacobian_wrt_input, dim=0)
+ 
+        return jacobian_wrt_input
+
+    def jump_gradient_wrt_theta(self, t, x):
+        t = t.expand(x.size(0), 1)
+        tz = torch.cat([t, x], dim=1)
+        with torch.enable_grad():
+            tz = tz.detach().requires_grad_()
+            jump_mag = self._jump_magnitude(tz)
+            # Initialize the Jacobian list
+            jacobian_wrt_weights = []
+            # Compute the Jacobian
+            for i in range(jump_mag.size(1)):  # Iterate over each output element
+                grad_output = torch.zeros_like(jump_mag)
+                grad_output[:, i] = 1
+                gradients = torch.autograd.grad(
+                    outputs=jump_mag,
+                    inputs=self._jump_magnitude.parameters(),
+                    grad_outputs=grad_output,
+                    create_graph=True,
+                    retain_graph=True,
+                    only_inputs=True
+                )
+                flattened_grads = torch.cat([grad.flatten() for grad in gradients])
+                jacobian_wrt_weights.append(flattened_grads)
+
+        # Stack the Jacobian rows to form the full Jacobian matrix
+        jacobian_wrt_weights = torch.stack(jacobian_wrt_weights, dim=0)
+   
+        return jacobian_wrt_weights
+
+    def jump_gradient_wrt_time(self, t, x):
+        t = t.expand(x.size(0), 1)
+        tz = torch.cat([t, x], dim=1)
+        with torch.enable_grad():
+            tz = tz.detach().requires_grad_()
+            jump_mag = self._jump_magnitude(tz)
+            grad_t = torch.autograd.grad(jump_mag, tz, torch.ones_like(jump_mag), retain_graph=True)
+        # check if this is correct
+        return grad_t[0][:, 0]  # Return gradient w.r.t. time only
+    
+    def jump_occurred_batch(self, t0, t1, batch_size):
+        expected_jumps = self._jump_intensity * (t1 - t0).item()
+        num_jumps = np.random.poisson([expected_jumps] * batch_size).tolist()
+        num_jumps = torch.tensor(num_jumps, device='mps')
+        
+        jump_times_list = []
+        for b in range(batch_size):
+            num_jumps_b = int(num_jumps[b].item())
+            if num_jumps_b > 0:
+                jump_times = torch.sort(t0 + (t1 - t0) * torch.rand((num_jumps_b,), device='mps')).values
+                jump_times_list.append(jump_times)
+            else:
+                jump_times_list.append(torch.tensor([], device='mps'))
+        
+        return jump_times_list
+    
 class HestonGenerator(torch.nn.Module):
     def __init__(
         self,
@@ -205,14 +303,12 @@ class HestonGenerator(torch.nn.Module):
             adjoint_method="adjoint_reversible_heun",
         )
         ys = xs.transpose(0, 1)
-        ys = ys[:, :, 0].unsqueeze(-1)
         # ys=self._readout(xs)
 
         ###################
         # Normalise the data to the form that the discriminator expects, in particular including time as a channel.
         ###################
         ts = ts.unsqueeze(0).unsqueeze(-1).expand(batch_size, ts.size(0), 1)
-        ys
         return torchcde.linear_interpolation_coeffs(torch.cat([ts, ys], dim=2))
 
 
@@ -359,7 +455,7 @@ def get_data(batch_size, device):
         dim=2,
     )
     # shape (dataset_size=1000, t_size=100, 1 + data_size=3)
-    ys = ys[:, :, 0:2]
+
     ###################
     # Package up.
     ###################
@@ -371,6 +467,7 @@ def get_data(batch_size, device):
     dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=batch_size, shuffle=True
     )
+
     return ts, data_size, dataloader
 
 
@@ -582,8 +679,8 @@ def main(
     # Training hyperparameters. Be prepared to tune these very carefully, as with any GAN.
     generator_lr=2e-3,  # Learning rate often needs careful tuning to the problem.
     discriminator_lr=1e-2,  # Learning rate often needs careful tuning to the problem.
-    batch_size=1024,  # Batch size.
-    steps=20,  # How many steps to train both generator and discriminator for.
+    batch_size=1,  # Batch size.
+    steps=50,  # How many steps to train both generator and discriminator for.
     init_mult1=2,  # Changing the initial parameter size can help.
     init_mult2=1.0,  #
     weight_decay=0.01,  # Weight decay.
@@ -598,12 +695,12 @@ def main(
         0.7,
         0.9,
     ),  # Plot some marginal distributions at this proportion of the way along.
-    load_best_weights=False,  # Whether to load the best weights at the end of training
+    load_best_weights=True,  # Whether to load the best weights at the end of training
 ):
     # device="mps"
     # print('HELLO?')
     # TODO: change
-    device = 'mps'
+    device='mps'
     # is_cuda = torch.cuda.is_available()
     # device = "cuda" if is_cuda else "cpu"
     # if not is_cuda:
@@ -656,9 +753,8 @@ def main(
     trange = tqdm.tqdm(range(steps))
     for step in trange:
         (real_samples,) = next(infinite_train_dataloader)
-        # real_samples = real_samples[:, :, 0:2]
+
         generated_samples = generator(ts, batch_size)
-        generated_samples = generated_samples[:, :, 0:2]
         generated_score = discriminator(generated_samples)
         real_score = discriminator(real_samples)
         loss = generated_score - real_score
@@ -749,7 +845,7 @@ def main(
     )
 
     plot_price(ts, generator, test_dataloader, num_plot_samples, plot_locs)
-    # plot_vol(ts, generator, test_dataloader, num_plot_samples, plot_locs)
+    plot_vol(ts, generator, test_dataloader, num_plot_samples, plot_locs)
 
 
 if __name__ == "__main__":
